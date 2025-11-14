@@ -1,0 +1,21 @@
+name: stock_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pandas
+  - numpy
+  - yfinance
+  - python-dotenv
+  - requests
+  - plotly
+  - dash
+  - dash-bootstrap-components
+  - sentence-transformers
+  - faiss-cpu
+  - pytorch
+  - transformers
+  - diskcache
+  - psutil
+  - multiprocess
+  - pandas-ta
