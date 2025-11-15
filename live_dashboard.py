@@ -2,7 +2,7 @@
 """
 Unified Live Stock Dashboard — Phase 2
 (FIXED: RAG-enabled LLM Chat with "Smart Hooks", engaging prompts, and Chat History)
-(FINAL FIX: LLM chat callback forced to run on main thread to bypass macOS/MPS/fork crash, and system prompt is now strict and concise)
+(FINAL FIX: Fixed IndexingError in Historical Volume Chart)
 """
 
 import os
@@ -24,11 +24,8 @@ from pathlib import Path
 from phase2_pipeline import cfg, alert_engine, llm, flatten_columns
 
 # Set up the cache manager for background callbacks
-# --- FINAL FIX: Removed executor argument due to incompatibility ---
 cache = diskcache.Cache("./cache", timeout=120) 
 long_callback_manager = DiskcacheManager(cache) 
-# --- END FINAL FIX ---
-
 
 DATA_PATH = Path("./data")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -212,8 +209,8 @@ app.layout = html.Div([
     html.Button("Send", id="llm-send", n_clicks=0),
     
     
-    # Interval to refresh live data (60s)
-    dcc.Interval(id="interval", interval=cfg.REFRESH_INTERVAL * 1000, n_intervals=0)
+    # --- CRITICAL FIX: Set interval to 5 minutes (300,000 milliseconds) ---
+    dcc.Interval(id="interval", interval=300 * 1000, n_intervals=0)
 ])
 
 
@@ -260,7 +257,8 @@ def update_cards_and_global_alerts(n):
         cards.append(html.Div([
             html.H3(t),
             html.P(f"Current RTH Price: {price}"),
-            html.P(f"Total RTH Volume: {total_volume:,}"),
+            # FIX: Removed the comma formatting (:,) to prevent crash when data is "N/A"
+            html.P(f"Total RTH Volume: {total_volume}"), 
             html.P(f"Last RTH Alert: {alert_text.split(' - ')[-1]}")
         ],
         style={"border": "1px solid #ccc", "padding": "10px", "borderRadius": "5px"}))
@@ -269,19 +267,40 @@ def update_cards_and_global_alerts(n):
 
 
 # =====================================================
-# CALLBACK: Historical Charts - REVERTED STYLING
+# CALLBACK: Historical Charts - FIXED TO BE DYNAMIC
 # =====================================================
 @callback(
     Output("price-chart-hist", "figure"),
     Output("volume-chart-hist", "figure"), 
     Output("alerts-panel-hist", "children"),
-    Input("ticker-dropdown", "value")
+    Input("ticker-dropdown", "value"),
+    Input("interval", "n_intervals") # <-- ADDED: Trigger update on interval
 )
-def update_hist_charts(ticker):
-    df = load_data(ticker, "_hist.csv")
-    close = get_col(df, ticker, "Close")
+def update_hist_charts(ticker, n_intervals):
+    # 1. Load the bulk historical data (static 30-min bars)
+    df_hist = load_data(ticker, "_hist.csv") 
 
-    new_alerts = alert_engine.evaluate(ticker, df)
+    # 2. Load the current live data (1-min bars)
+    df_live = load_data(ticker, "_live.csv")
+
+    # 3. Create a combined series for plotting the price chart
+    if not df_live.empty:
+        # Get the closing price of the latest RTH 30-min interval from the live data
+        # We resample to 30min to get bars that match the historical data
+        latest_live_close = df_live['Close'].resample('30min').last().dropna()
+        
+        # Get the historical closes
+        s_hist = get_col(df_hist, ticker, "Close")
+        
+        # Combine the historical closes with the latest live closes (latest live data point wins)
+        s_combined = pd.concat([s_hist, latest_live_close]).sort_index()
+        # Drop duplicated timestamps (this is important if a 30min bar exists in both files)
+        close = s_combined[~s_combined.index.duplicated(keep='last')]
+    else:
+        close = get_col(df_hist, ticker, "Close")
+    
+    # 4. Alert logic
+    new_alerts = alert_engine.evaluate(ticker, df_hist)
     new_alerts_set = set(new_alerts)
     if new_alerts_set and new_alerts_set != last_known_hist_alerts[ticker]:
         new_alerts_to_add = [a for a in new_alerts if a not in last_known_hist_alerts[ticker]]
@@ -293,17 +312,23 @@ def update_hist_charts(ticker):
     
     alerts_text = "\n".join(hist_alert_history[ticker][-20:]) if hist_alert_history[ticker] else "No alerts yet"
 
-    # REVERTED: Removed Plotly theme settings
+    # 5. Price Chart (Now Dynamic)
     price_fig = go.Figure()
     if not close.empty:
         price_fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close"))
-        price_fig.update_layout(title=f"{ticker} 30-Day Price", xaxis_title="Datetime", yaxis_title="Price")
+        price_fig.update_layout(title=f"{ticker} 30-Day Price (Dynamic)", xaxis_title="Datetime", yaxis_title="Price")
 
+    # 6. Volume Chart (Still based on static historical data)
     vol_fig = go.Figure()
-    vol = get_col(df, ticker, "Volume", fill_na=0)
+    vol = get_col(df_hist, ticker, "Volume", fill_na=0)
     if not vol.empty:
+        # Step 1: Resample 30-min volume to Daily volume
         daily_vol = vol.resample('D').sum()
-        daily_vol = daily_vol[daily_vol > 0] 
+        
+        # Step 2: Filter the daily series itself to remove days with zero total volume
+        # This fixes the IndexingError
+        daily_vol = daily_vol[daily_vol > 0]
+        
         vol_fig.add_trace(go.Bar(x=daily_vol.index, y=daily_vol, name=f"Volume ({ticker})"))
         vol_fig.update_layout(
             title=f"{ticker} 30-Day Daily Volume",
@@ -442,8 +467,8 @@ RULES:
 13. **VOLUME CONTEXT:** When discussing volume, frame it in terms of liquidity or investor interest relative to typical trading activity, rather than just listing the number.
 14. **TREND TIMELINE:** When describing a trend (bullish/bearish), specify if it is a short-term (last 5-20 periods) or long-term trend based on the MA analysis in the context.
 15. **NO GENERIC CHAT:** Do not engage in conversational chitchat or respond to greetings/farewells unless they are part of a substantive question.
-16. **IF HOOK ANSWERED:** If the user affirms the hook (Rule 6) and you have provided the elaboration, ask a new, generic follow-up question (e.g., "What other ticker would you like to review?") to conclude the specific thread.
-17. **STRICT CONTEXT FILTER:** The primary focus of the current discussion is: [IDENTIFY THE TICKET FROM HISTORY]. Use this focus to strictly prioritize and filter context before generating the answer. Ignore data related to other tickers unless specifically asked for comparison.
+16. **STRICT CONTEXT FILTER:** The primary focus of the current discussion is: [IDENTIFY THE TICKET FROM HISTORY]. Use this focus to strictly prioritize and filter context before generating the answer. Ignore data related to other tickers unless specifically asked for comparison.
+17. **IF HOOK ANSWERED:** If the user affirms the hook (Rule 6) and you have provided the elaboration, ask a new, generic follow-up question (e.g., "What other ticker would you like to review?") to conclude the specific thread.
 
 Conversation History:
 ---

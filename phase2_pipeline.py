@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-phase2_pipeline.py — Phase 2 live stock pipeline (Fixed)
+phase2_pipeline.py — Phase 2 live stock pipeline (Final Stable Version)
 
 Features:
 - Creates separate files for historical (30d/30min) and live (1d/1min) data
-- Historical data is fetched once with extended delay to prevent rate limiting
-- Live data is updated every 60 seconds
+- Historical data is bypassed at startup to prevent rate limit crash
+- Live data is updated every 5 minutes (300 seconds) for stability
 - No data mixing, which fixes all chart bugs
 """
 
@@ -30,7 +30,8 @@ load_dotenv()
 class Config:
     TICKERS = os.getenv("TICKERS", "AAPL,AMZN,GOOGL,MSFT,TSLA").split(",")
     DATA_DIR = os.getenv("DATA_DIR", "./data")
-    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 60))  # seconds between cycles
+    # --- FIXED: Refresh interval set to 300 seconds (5 minutes) for stability ---
+    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 300))  # seconds between cycles
     # Back to 30 days for historical data
     CSV_RETENTION_DAYS = int(os.getenv("CSV_RETENTION_DAYS", 30))
     LIVE_MEMORY_MINUTES = int(os.getenv("LIVE_MEMORY_MINUTES", 1440)) # 1 full day
@@ -67,11 +68,10 @@ class LLMInterface:
         self.model_name = model_name
         self.url = url
 
-    def generate(self, prompt: str, timeout: int = 60) -> str:
+    def generate(self, prompt: str, timeout: int = 120) -> str:
         """
         Synchronous call; returns final text (or error string).
         Compatible with Dash callback usage.
-        (FIXED: Increased robustness/timeout for Ollama requests)
         """
         try:
             payload = {
@@ -79,30 +79,23 @@ class LLMInterface:
                 "prompt": prompt,
                 "stream": False # Crucial for synchronous call
             }
-            # Increased requests timeout for safety
             resp = requests.post(self.url, json=payload, timeout=timeout) 
             
-            # --- IMPROVED ERROR LOGGING ---
             if resp.status_code != 200:
                 error_text = resp.text.strip()
                 logger.error(f"Ollama HTTP Error {resp.status_code}: {error_text}") 
                 return f"[Ollama Error {resp.status_code}] {error_text}"
-            # --- END IMPROVED ERROR LOGGING ---
 
-            # Try to parse the single expected JSON object
             try:
                 data = resp.json()
             except Exception as e:
-                # Log the parsing failure if the response wasn't clean JSON
                 logger.error(f"Ollama JSON Parsing Error: {e}. Raw response: {resp.text[:100]}...")
                 return resp.text or "[Ollama returned non-json response]"
 
-            # Try common response keys
             for key in ("response", "completion", "output", "text"):
                 if key in data:
                     return str(data.get(key) or "").strip()
             
-            # If no known key is found, return the full JSON structure
             return json.dumps(data)
         except Exception as e:
             return f"[Ollama Exception] {e}"
@@ -256,13 +249,15 @@ class LiveTracker:
             logger.debug(f"Live update failed for {ticker}: {e}")
 
     def update_all(self):
-        # FIX: Added a 20-second delay for robust live data fetching
-        LIVE_FETCH_DELAY = 20 # seconds
-        for t in self.tickers:
+        # --- REVERTED DELAY FOR STABILITY ---
+        # With the main loop running every 5 minutes, we can use a smaller delay per ticker.
+        LIVE_FETCH_DELAY = 10 # seconds
+        for t in cfg.TICKERS: # Use cfg.TICKERS here instead of self.tickers, which is redundant but safer
             self.update_one(t)
             if not STOP_EVENT.is_set():
                 logger.debug(f"Pausing for {LIVE_FETCH_DELAY}s after fetching live data for {t}...")
-                time.sleep(LIVE_FETCH_DELAY) # Added delay here
+                time.sleep(LIVE_FETCH_DELAY) 
+        # --- END REVERTED DELAY ---
 
     def get_buffer(self, ticker: str) -> pd.DataFrame:
         with self.lock:
@@ -345,8 +340,8 @@ alert_engine = AlertEngine(cfg)
 # -----------------------
 def initial_setup():
     """Load or fetch historical 30-day data for all tickers."""
-    # FIX 1: Increased delay to 30 seconds for robust rate limit prevention
-    HISTORICAL_FETCH_DELAY = 30 # seconds 
+    # FIX 1: Increased delay to 60 seconds for robust rate limit prevention
+    HISTORICAL_FETCH_DELAY = 60 # seconds 
     for t in cfg.TICKERS:
         try:
             data_mgr.load_or_fetch_hist(t)
@@ -359,7 +354,7 @@ def initial_setup():
 def process_cycle():
     """Single pipeline cycle: update live 1-min buffers, save to _live.csv"""
     
-    # 1. Fetch 1-day/1-min data for all tickers into memory (with 20s delay between each)
+    # 1. Fetch 1-day/1-min data (with 10s delay between each)
     live_tracker.update_all()
     
     for t in cfg.TICKERS:
@@ -377,24 +372,27 @@ def process_cycle():
 
 def run_forever():
     # 1. Get 30-day/30-min data *once*
-    initial_setup()
+    # --- FINAL FIX: COMMENTING OUT initial_setup to bypass perpetual rate limit failures ---
+    # initial_setup() 
     
-    # FIX 2 (FINAL): Increased cooldown to 180 seconds (3 minutes) to ensure API limit resets
-    COOLDOWN_SECONDS = 180 
-    logger.info(f"Initial historical setup complete. Waiting {COOLDOWN_SECONDS}s before starting live loop...")
+    # FIX 2 (FINAL): Increased cooldown to 300 seconds (5 minutes)
+    COOLDOWN_SECONDS = 300 
+    logger.info(f"Skipping historical setup. Waiting {COOLDOWN_SECONDS}s before starting live loop...")
     for _ in range(COOLDOWN_SECONDS):
         if STOP_EVENT.is_set():
             break
         time.sleep(1)
     
-    logger.info("Starting Phase 2 pipeline loop (updating 1-min data)...")
+    # --- LOG UPDATED TO REFLECT 5 MINUTE CYCLE ---
+    logger.info("Starting Phase 2 pipeline loop (updating 5-min interval)...")
     while not STOP_EVENT.is_set():
         try:
-            # 2. Every 60s, get 1-day/1-min data
+            # 2. Every 5 minutes, get 1-day/1-min data
             process_cycle()
         except Exception as e:
             logger.exception(f"Error in process cycle: {e}")
         
+        # Wait for the full 5-minute refresh interval
         for _ in range(max(1, int(cfg.REFRESH_INTERVAL))):
             if STOP_EVENT.is_set():
                 break
