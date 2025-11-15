@@ -1,4 +1,4 @@
-I
+
 # 📈 Live Stock Analysis Agent (Phase 2)
 
 This project establishes a robust, real-time stock analysis system. Designed for a **Local Development Environment**, it runs three concurrent services: a data ingestion pipeline, a RAG vector indexing service, and a live web dashboard featuring an LLM-powered financial analyst chat.
@@ -41,7 +41,7 @@ Create a file named **`.env`** in the root directory to configure the pipeline (
 ```env
 # .env
 TICKERS="AAPL,AMZN,GOOGL,MSFT,TSLA"
-REFRESH_INTERVAL=60
+REFRESH_INTERVAL=300
 DATA_DIR="./Data"
 # Ensure Ollama is running and accessible
 OLLAMA_API_URL="http://localhost:11434/api/generate"
@@ -102,8 +102,8 @@ The project is structured around three independent services managed by `run_all.
 | Detail | Description |
 | :--- | :--- |
 | **Purpose** | The core data ingestion and processing script. |
-| **Data Flow** | **Historical:** Fetches **30 days** of **30-minute** data (`*_hist.csv`) once. A **30-second delay** between tickers mitigates API rate limiting. **Live:** Polls **1-minute** data for the current day (`*_live.csv`) every **60 seconds**. |
-| **Key Components** | `LiveTracker`/`DataManager` for data persistence. `AlertEngine` for rule-based checks (Trend, Price Swing, Volume). `LLMInterface` for synchronous Ollama communication. |
+| **Data Flow** | **Historical:** The *unreliable initial fetch* is **bypassed** (`initial_setup()` is commented out) to maintain stability. Data is assumed to exist. **Live:** Polls **1-minute** data for the current day (`*_live.csv`) every **5 minutes** (300s). |
+| **Key Components** | `LiveTracker`/`DataManager` for data persistence. **Stable Logic:** Uses a **5-minute refresh cycle** and a **10-second delay** between individual ticker fetches for reliability. `AlertEngine` for rule-based checks (Trend, Price Swing, Volume). `LLMInterface` for synchronous Ollama communication. |
 | **Local Limitation** | Heavy reliance on `time.sleep()` and local CSV files (`./Data`). The LLM interface is synchronous, blocking the thread while waiting for Ollama. |
 
 ### `build_vector_index.py` (RAG Indexing Service)
@@ -124,8 +124,8 @@ The project is structured around three independent services managed by `run_all.
 | Detail | Description |
 | :--- | :--- |
 | **Purpose** | The user-facing web application that displays real-time data and hosts the interactive **RAG-enabled LLM Chatbot**. |
-| **Visualization** | Displays two pairs of charts (Historical Price/Volume and Live Price/Volume) and real-time alerts. |
-| **RAG Chatbot Logic** | Uses **`search_rag_index`** to retrieve semantic context. Sends the chat history and retrieved context to the **Ollama** LLM using a **strict system prompt** (17 rules) to ensure a professional, data-driven response. |
+| **Visualization** | Displays two pairs of charts (**Dynamic Historical** chart updates its endpoint with the latest live data point, and Live Price/Volume) and real-time alerts. |
+| **RAG Chatbot Logic** | Uses **`search_rag_index`** to retrieve semantic context. Sends the chat history and retrieved context to the **Ollama** LLM using a **strict system prompt (17 rules)** to ensure a professional, data-driven response and eliminate repetition. |
 | **Local Limitation** | The `chat_llm` callback runs **synchronously** on the main thread, causing the UI to freeze momentarily during the LLM's response generation. |
 
 -----
@@ -149,3 +149,8 @@ The current single-machine architecture can be refactored into three distinct **
 3.  **Data Persistence:** Migrate all stock data from local CSVs to a **managed time-series database**. Move the RAG index to a **cloud-native vector database**.
 4.  **LLM Infrastructure:** Deploy **Ollama** as a dedicated, **GPU-accelerated** service or use a managed LLM provider for fast, scalable inference.
 5.  **API Communication:** Implement **gRPC** for low-latency, internal service-to-service communication between the microservices.
+
+<!-- end list -->
+
+```
+```
