@@ -443,6 +443,7 @@ RULES:
 14. **TREND TIMELINE:** When describing a trend (bullish/bearish), specify if it is a short-term (last 5-20 periods) or long-term trend based on the MA analysis in the context.
 15. **NO GENERIC CHAT:** Do not engage in conversational chitchat or respond to greetings/farewells unless they are part of a substantive question.
 16. **IF HOOK ANSWERED:** If the user affirms the hook (Rule 6) and you have provided the elaboration, ask a new, generic follow-up question (e.g., "What other ticker would you like to review?") to conclude the specific thread.
+17. **STRICT CONTEXT FILTER:** The primary focus of the current discussion is: [IDENTIFY THE TICKET FROM HISTORY]. Use this focus to strictly prioritize and filter context before generating the answer. Ignore data related to other tickers unless specifically asked for comparison.
 
 Conversation History:
 ---

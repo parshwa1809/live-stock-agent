@@ -125,7 +125,7 @@ The project is structured around three independent services managed by `run_all.
 | :--- | :--- |
 | **Purpose** | The user-facing web application that displays real-time data and hosts the interactive **RAG-enabled LLM Chatbot**. |
 | **Visualization** | Displays two pairs of charts (Historical Price/Volume and Live Price/Volume) and real-time alerts. |
-| **RAG Chatbot Logic** | Uses **`search_rag_index`** to retrieve semantic context. Sends the chat history and retrieved context to the **Ollama** LLM using a **strict system prompt** (16 rules) to ensure a professional, data-driven response. |
+| **RAG Chatbot Logic** | Uses **`search_rag_index`** to retrieve semantic context. Sends the chat history and retrieved context to the **Ollama** LLM using a **strict system prompt** (17 rules) to ensure a professional, data-driven response. |
 | **Local Limitation** | The `chat_llm` callback runs **synchronously** on the main thread, causing the UI to freeze momentarily during the LLM's response generation. |
 
 -----
