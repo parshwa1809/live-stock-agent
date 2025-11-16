@@ -1,9 +1,34 @@
+# 📈 Live Stock Analysis Agent — Project Summary & RAG Architecture
 
-# 📈 Live Stock Analysis Agent (Phase 2)
+### 1\. Project Objective
 
-This project establishes a robust, real-time stock analysis system. Designed for a **Local Development Environment**, it runs three concurrent services: a data ingestion pipeline, a RAG vector indexing service, and a live web dashboard featuring an LLM-powered financial analyst chat.
+This project is a terminal-based agent that fetches live stock prices (minute-level), processes historical logs using Retrieval-Augmented Generation (RAG), and generates natural-language explanations using an LLM. It successfully integrates LLMs with real-world, time-series data to deliver insights and provide real-time alert notifications for stock movements.
 
----
+-----
+
+### 2\. Core Features
+
+  * **RAG Pipeline:** Implements a full RAG pipeline for time-series data, using historical stock logs as the knowledge base.
+  * **Data Ingestion:** Ingests both live (1-minute) and historical (30-minute interval) stock data from Yahoo Finance.
+  * **Vector Embeddings:** Creates and manages a FAISS index for efficient semantic retrieval over historical data.
+  * **LLM-Powered Insights:** Generates natural-language explanations of stock trends, anomalies, and movements.
+  * **Live Dashboard:** Features a local UI (Dash/FastAPI) for visualization and interactive insights.
+  * **Real-time Alerts:** Provides threshold-based alerts for multiple tickers.
+
+-----
+
+### 3\. Technology Stack
+
+  * **Data Fetching:** `yfinance`
+  * **Data Handling:** `pandas`, `pandas-ta`
+  * **Environment:** `python-dotenv`, `conda`
+  * **Embeddings:** `sentence-transformers`
+  * **Vector Index:** `FAISS`
+  * **LLM:** `Ollama` (local), `OpenAI API` (optional)
+  * **Backend/Dashboard:** `dash`, `dash-bootstrap-components`, `FastAPI`
+  * **Concurrency:** `subprocess`, `threading`
+
+-----
 
 ## 🚀 Getting Started
 
@@ -13,7 +38,7 @@ This project establishes a robust, real-time stock analysis system. Designed for
 2.  **Ollama:** Ensure the **Ollama service** is running locally on your machine, and the model specified in your `.env` file (`phi3:mini` by default) is downloaded.
 3.  **Repository Setup:** Ensure you have created your `.gitignore` file (see below) and pushed all necessary source files to your repository.
 
-### 1. Repository & Environment Setup
+### 1\. Repository & Environment Setup
 
 Create a file named **`.gitignore`** in the root directory:
 
@@ -34,7 +59,7 @@ Data/
 # Conda environment directory
 .venv/
 venv/
-````
+```
 
 Create a file named **`.env`** in the root directory to configure the pipeline (do NOT commit this file):
 
@@ -67,7 +92,7 @@ python run_all.py
 
 Once the services are running, open your web browser to:
 
-👉 **http://127.0.0.1:8050**
+👉 **[http://127.0.0.1:8050](http://127.0.0.1:8050)**
 
 ### 4\. Shutdown
 
@@ -130,6 +155,21 @@ The project is structured around three independent services managed by `run_all.
 
 -----
 
+## 💡 LLM & RAG Capabilities
+
+The agent's "intelligence" comes from combining both historical and real-time data to answer user queries.
+
+  * **LLM Explanations:** The LLM uses RAG to generate natural-language insights. It combines context from the **historical 30-min data** (via FAISS) and the **recent 1-min in-memory data**.
+  * **Example Prompts:** The system can successfully answer prompts such as:
+      * "Explain today’s price movement for {ticker}."
+      * "Summarize last week’s stock trend."
+      * "Identify potential anomalies in recent data."
+  * **User-facing Deliverables:**
+      * **Dashboard:** An interactive dashboard displays current prices, historical trends, the LLM-generated explanations, and live alerts.
+      * **Insights:** The system delivers volatility analysis, trend patterns, and anomaly detection.
+
+-----
+
 ## ☁️ Future Optimization: Cloud Deployment & Microservices
 
 The current single-machine architecture can be refactored into three distinct **Microservices** for improved scalability, resilience, and independent deployment in a cloud environment (e.g., AWS, GCP).
@@ -150,7 +190,13 @@ The current single-machine architecture can be refactored into three distinct **
 4.  **LLM Infrastructure:** Deploy **Ollama** as a dedicated, **GPU-accelerated** service or use a managed LLM provider for fast, scalable inference.
 5.  **API Communication:** Implement **gRPC** for low-latency, internal service-to-service communication between the microservices.
 
-<!-- end list -->
+-----
 
-```
-```
+## 📚 References
+
+  * **yfinance:** [https://pypi.org/project/yfinance/](https://pypi.org/project/yfinance/)
+  * **FastAPI:** [https://fastapi.tiangolo.com/](https://fastapi.tiangolo.com/)
+  * **Chart.js:** [https://www.chartjs.org/docs/latest/](https://www.chartjs.org/docs/latest/)
+  * **OpenAI API:** [https://platform.openai.com/docs/](https://platform.openai.com/docs/)
+  * **FAISS:** [https://faiss.ai/](https://faiss.ai/)
+  * **sentence-transformers:** [https://www.sbert.net/](https://www.sbert.net/)
