@@ -5,7 +5,7 @@ phase2_pipeline.py — Phase 2 live stock pipeline (Final Stable Version)
 Features:
 - Creates separate files for historical (30d/30min) and live (1d/1min) data
 - Historical data is bypassed at startup to prevent rate limit crash
-- Live data is updated every 5 minutes (300 seconds) for stability
+- **FIXED: Live data is updated every 5 minutes using a SINGLE BULK API CALL.**
 - No data mixing, which fixes all chart bugs
 """
 
@@ -111,12 +111,24 @@ def flatten_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     # flatten MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            f"{a}_{b}" if (isinstance(b, str) and b) else str(a)
-            for a,b in df.columns
-        ]
+        # Handle MultiIndex DataFrame from bulk fetch (e.g., Close, Open for AAPL, MSFT)
+        # We only flatten here if it's the expected structure (like for live data split later)
+        # For historical data, this flattening might be necessary to fix old file structures
+        new_cols = []
+        for col_level1, col_level2 in df.columns:
+            # If the index is (Attribute, Ticker), we want 'Attribute_Ticker'
+            if col_level2.upper() in cfg.TICKERS:
+                new_cols.append(f"{col_level1}_{col_level2}")
+            # If the index is (Attribute, ''), we just want 'Attribute' (for single ticker fetch)
+            elif not col_level2:
+                new_cols.append(col_level1)
+            else:
+                new_cols.append(f"{col_level1}_{col_level2}")
 
-    # clean stringified tuple columns like "('Close','AAPL')"
+        df.columns = new_cols
+    
+    # Clean up stringified tuple columns like "('Close','AAPL')" - this is a legacy fix
+    # We leave this in case old CSVs have this format, but the bulk fetch fixes this.
     new_cols = []
     for c in df.columns:
         if isinstance(c, str) and c.startswith("(") and "," in c and c.endswith(")"):
@@ -140,6 +152,7 @@ def flatten_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         except Exception:
             pass
 
+    # Ensure canonical columns exist for single ticker access
     base_cols = ["Open", "High", "Low", "Close", "Volume"]
     for base in base_cols:
         suff = f"{base}_{ticker}"
@@ -193,9 +206,11 @@ class DataManager:
             self.historical[ticker] = df
             logger.info(f"Loaded {ticker} HISTORICAL: {len(df)} rows")
             return df
+        # Note: If called, it will run the single-ticker fetch below, which is slow/risky
         return self.fetch_historical(ticker)
 
     def fetch_historical(self, ticker: str, start=None, end=None) -> pd.DataFrame:
+        # This function is retained but is what we recommend avoiding for multiple tickers.
         end = end or datetime.now(timezone.utc)
         start = start or (end - timedelta(days=cfg.CSV_RETENTION_DAYS))
         logger.info(f"Fetching 30-MINUTE historical for {ticker} from {start.date()} to {end.date()}")
@@ -220,7 +235,7 @@ class DataManager:
 data_mgr = DataManager(cfg.TICKERS, cfg.DATA_DIR)
 
 # -----------------------
-# LiveTracker (Handles LIVE 1-day/1-min data)
+# LiveTracker (Handles LIVE 1-day/1-min data) - MODIFIED FOR BULK FETCH
 # -----------------------
 class LiveTracker:
     def __init__(self, tickers):
@@ -228,49 +243,72 @@ class LiveTracker:
         self._buffers = {t: pd.DataFrame() for t in self.tickers}
         self.lock = threading.Lock()
 
-    def update_one(self, ticker: str):
+    def update_all(self):
         """
-        Fetch all 1-minute data for the current day.
+        Fetch all 1-minute data for ALL tickers in a single bulk API call.
         """
+        logger.info("Starting BULK live data fetch for all tickers.")
         try:
-            # Fetch 1-day, 1-minute data
-            df = yf.download(ticker, period="1d", interval="1m", progress=False)
-            if df is None or df.empty:
-                logger.debug(f"No LIVE data for {ticker} (market may be closed)")
+            # --- CRITICAL FIX: Single bulk call for all tickers ---
+            # Fetch 1-day, 1-minute data for all tickers
+            df_bulk = yf.download(self.tickers, period="1d", interval="1m", progress=False)
+            
+            if df_bulk is None or df_bulk.empty:
+                logger.debug("No BULK LIVE data (market may be closed or rate limit error)")
                 return
-                
-            df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
-            df = flatten_columns(df, ticker)
+            
+            # Ensure the index is a datetime index
+            df_bulk.index = pd.to_datetime(df_bulk.index, utc=True, errors='coerce')
             
             with self.lock:
-                self._buffers[ticker] = df
-                
+                for t in self.tickers:
+                    # 1. Slice the MultiIndex DataFrame for the specific ticker
+                    # The MultiIndex is structured as (Attribute, Ticker)
+                    # Use df_bulk.columns.get_level_values(1) to check which tickers are present
+                    
+                    if t in df_bulk.columns.get_level_values(1):
+                        # Extract all attributes (Open, High, Low, etc.) for the current ticker (t)
+                        df_ticker = df_bulk.xs(t, level=1, axis=1)
+                        
+                        # 2. Rename columns to canonical format (e.g., 'Close' not 'Close_AAPL') for the buffer
+                        df_ticker.columns.name = None # Remove the name of the column level
+                        df_ticker.columns = [c.capitalize() for c in df_ticker.columns]
+                        
+                        # 3. Store the cleaned single-ticker DataFrame in the buffer
+                        self._buffers[t] = df_ticker
+                        logger.debug(f"Successfully updated live buffer for {t} ({len(df_ticker)} rows).")
+                    else:
+                        logger.warning(f"Ticker {t} not found in the bulk download result.")
+                        
         except Exception as e:
-            logger.debug(f"Live update failed for {ticker}: {e}")
-
-    def update_all(self):
-        # --- REVERTED DELAY FOR STABILITY ---
-        # With the main loop running every 5 minutes, we can use a smaller delay per ticker.
-        LIVE_FETCH_DELAY = 10 # seconds
-        for t in cfg.TICKERS: # Use cfg.TICKERS here instead of self.tickers, which is redundant but safer
-            self.update_one(t)
-            if not STOP_EVENT.is_set():
-                logger.debug(f"Pausing for {LIVE_FETCH_DELAY}s after fetching live data for {t}...")
-                time.sleep(LIVE_FETCH_DELAY) 
-        # --- END REVERTED DELAY ---
+            # This will catch a single YFRateLimitError for the entire batch, which is much cleaner
+            logger.error(f"Bulk live update failed: {e}")
 
     def get_buffer(self, ticker: str) -> pd.DataFrame:
         with self.lock:
             buf = self._buffers.get(ticker)
-            return buf.copy() if buf is not None else pd.DataFrame()
+            # Need to re-flatten the columns on output to satisfy the AlertEngine/Flatten func 
+            # and ensure it has the expected 'Close_TICKER' format if needed.
+            df_copy = buf.copy() if buf is not None else pd.DataFrame()
+            return flatten_columns(df_copy, ticker)
+
 
     def save_buffer(self, ticker: str, data_dir: Path):
         """Saves the current live buffer to a _live.csv file."""
         p = Path(data_dir) / f"{ticker}_live.csv"
         buf = self.get_buffer(ticker)
-        if not buf.empty:
+        
+        # Ensure we are saving the canonical format with Ticker suffix for easy reading later
+        df_to_save = buf.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in df_to_save.columns:
+                df_to_save[f"{col}_{ticker}"] = df_to_save[col]
+                del df_to_save[col]
+
+        if not df_to_save.empty:
             try:
-                buf.to_csv(p)
+                df_to_save.to_csv(p)
+                logger.info(f"Saved LIVE CSV for {ticker}")
             except Exception as e:
                 logger.warning(f"Failed to save LIVE CSV for {ticker}: {e}")
 
@@ -286,17 +324,12 @@ class AlertEngine:
     def _series(self, df: pd.DataFrame, ticker: str, name: str) -> pd.Series:
         if df is None or df.empty:
             return pd.Series(dtype=float)
-        if name in df.columns:
-            s = df[name]
-            return s.dropna() if hasattr(s, "dropna") else pd.Series(dtype=float)
-        suff = f"{name}_{ticker}"
-        if suff in df.columns:
-            s = df[suff]
-            return s.dropna() if hasattr(s, "dropna") else pd.Series(dtype=float)
-        for c in df.columns:
-            if isinstance(c, str) and c.startswith(name):
-                s = df[c]
-                return s.dropna() if hasattr(s, "dropna") else pd.Series(dtype=float)
+        # Check for both canonical 'Close' and suffixed 'Close_TICKER'
+        for col_name in [name, f"{name}_{ticker}"]:
+            if col_name in df.columns:
+                s = df[col_name]
+                return pd.to_numeric(s, errors='coerce').dropna()
+                
         return pd.Series(dtype=float)
 
     def evaluate(self, ticker: str, df: pd.DataFrame):
@@ -340,7 +373,7 @@ alert_engine = AlertEngine(cfg)
 # -----------------------
 def initial_setup():
     """Load or fetch historical 30-day data for all tickers."""
-    # FIX 1: Increased delay to 60 seconds for robust rate limit prevention
+    # This is still here in case you want to uncomment and run it separately.
     HISTORICAL_FETCH_DELAY = 60 # seconds 
     for t in cfg.TICKERS:
         try:
@@ -354,11 +387,12 @@ def initial_setup():
 def process_cycle():
     """Single pipeline cycle: update live 1-min buffers, save to _live.csv"""
     
-    # 1. Fetch 1-day/1-min data (with 10s delay between each)
+    # 1. Fetch 1-day/1-min data using a single bulk call
     live_tracker.update_all()
     
     for t in cfg.TICKERS:
         # 2. Save the live data from memory to `_live.csv`
+        # This step is still done individually because we need to save one file per ticker
         live_tracker.save_buffer(t, cfg.DATA_DIR)
         
         # 3. (Optional) Run alerts on the live data

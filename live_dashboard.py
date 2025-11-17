@@ -3,6 +3,7 @@
 Unified Live Stock Dashboard — Phase 2
 (FIXED: RAG-enabled LLM Chat with "Smart Hooks", engaging prompts, and Chat History)
 (FINAL FIX: Fixed IndexingError in Historical Volume Chart)
+(FIXED: KeyError by ensuring the hidden trigger component is in the main layout)
 """
 
 import os
@@ -156,7 +157,7 @@ def get_col(df, ticker, col, fill_na=None):
 
 
 # =====================================================
-# LAYOUT (4 charts) - REVERTED TO ORIGINAL STRUCTURE
+# LAYOUT (4 charts) - FIXED HIDDEN TRIGGER LOCATION
 # =====================================================
 app.layout = html.Div([
     # --- ADDED: Session storage for chat history ---
@@ -210,7 +211,10 @@ app.layout = html.Div([
     
     
     # --- CRITICAL FIX: Set interval to 5 minutes (300,000 milliseconds) ---
-    dcc.Interval(id="interval", interval=300 * 1000, n_intervals=0)
+    dcc.Interval(id="interval", interval=300 * 1000, n_intervals=0),
+
+    # --- FIX FOR KEYERROR: The hidden div MUST be defined in the layout structure ---
+    html.Div(id="alerts-panel-live-hidden-trigger", style={"display": "none"}),
 ])
 
 
@@ -247,7 +251,7 @@ def update_cards_and_global_alerts(n):
             last_known_live_alerts[t] = new_alerts_set
 
         if close.empty:
-            price, total_volume, alert_text = "N/A", "N/A", "Market Closed"
+            price, total_volume, alert_text = "N/A", "N/A", "Market Closed / No Data"
         else:
             price = round(float(close.iloc[-1]), 2)
             total_volume = int(vol.sum()) 
@@ -500,7 +504,6 @@ Helpful Analyst Answer (for the latest User question only):
 # RUN APP
 # =====================================================
 if __name__ == "__main__":
-    # Add a hidden div to act as a trigger for alert refreshes
-    app.layout.children.append(html.Div(id="alerts-panel-live-hidden-trigger", style={"display": "none"}))
+    # The hidden div is now in app.layout, so we remove the append call here.
     logger.info("Starting dashboard at http://127.0.0.1:8050")
     app.run(debug=False)
