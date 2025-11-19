@@ -8,6 +8,8 @@ Features:
   tickers SERIALLY, with a 5-minute cooldown between *each* ticker.
 - **Service Launch:** Starts the three main services in parallel.
 - **File Structure:** Merges historical and live data into a single unified file (<TICKER>.csv).
+- **CRITICAL FIX:** Implements a strict retry loop to ensure all tickers download successfully
+  before launching the dashboard.
 """
 
 import threading
@@ -104,7 +106,12 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
         
         # IMPORTANT: The single file is now named <TICKER>.csv
         path = data_dir / f"{ticker}.csv"
-        df_to_save.to_csv(path)
+        path_tmp = data_dir / f"{ticker}.csv.tmp"
+        
+        # Atomic write
+        df_to_save.to_csv(path_tmp) 
+        os.replace(path_tmp, path)
+        
         logger.info(f"[Setup] ✅ Successfully saved {ticker}.csv ({len(df_to_save)} rows) at 5-min interval.")
 
     except Exception as e:
@@ -112,57 +119,62 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
 
 def run_initial_data_fetch():
     """
-    Checks if unified data files exist. If not, fetches them in ultra-safe serial mode.
+    STRICT BLOCKING MODE: Fetches all historical data and retries failed tickers
+    indefinitely (up to MAX_RETRIES) before starting the main services.
     """
     logger.info("="*50)
-    logger.info("Checking for required unified data files...")
+    logger.info("🔒 STRICT SETUP: Checking and downloading all 30-day historical data...")
     
-    # Need to load config first (now handled by centralized import)
-    # load_dotenv() # Removed
-    # cfg = Config() # Removed
     data_dir = Path(cfg.DATA_DIR)
     data_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Use ALL_FETCH_TICKERS to ensure context tickers are included
     all_tickers = cfg.ALL_FETCH_TICKERS 
-    tickers_to_fetch = []
     
-    for ticker in all_tickers:
-        # IMPORTANT: Check for the single, unified file: <TICKER>.csv
-        path = data_dir / f"{ticker}.csv"
-        # Also check for the old structure for backwards compatibility during transition
-        if not path.exists() and not (data_dir / f"{ticker}_hist.csv").exists():
-            tickers_to_fetch.append(ticker)
-            
-    if not tickers_to_fetch:
-        logger.info("All unified data files already exist. Skipping setup.")
-        logger.info("="*50)
-        return
+    MAX_RETRIES = 5  # Total passes allowed for all tickers
+    retry_delay = HISTORICAL_DELAY_SECONDS # 5 minutes wait between individual fetches
+    attempt_count = 0
+    
+    while True:
+        # Re-evaluate missing tickers every loop
+        missing_tickers = []
+        for ticker in all_tickers:
+            path = data_dir / f"{ticker}.csv"
+            if not path.exists():
+                missing_tickers.append(ticker)
         
-    logger.warning(f"Missing unified data for: {tickers_to_fetch}")
-    
-    num_tickers = len(tickers_to_fetch)
-    
-    logger.info(f"Starting one-time serial fetch for {num_tickers} tickers (5-minute delay between each).")
-    
-    for i, ticker in enumerate(tickers_to_fetch):
-        if STOP_EVENT.is_set():
-            logger.info("[Setup] Shutdown signal received during fetch. Aborting.")
-            return
-            
-        logger.info(f"[Setup] Processing Ticker {i+1}/{num_tickers}: {ticker}...")
-        fetch_and_save_initial_data(ticker, cfg, data_dir)
+        # ✅ EXIT CONDITION: All files exist
+        if not missing_tickers:
+            logger.info("✅ All unified data files successfully secured!")
+            logger.info("="*50)
+            return # <--- This allows the main script to continue to launch services
+
+        # ❌ FAILURE CONDITION
+        attempt_count += 1
+        if attempt_count > MAX_RETRIES:
+            logger.critical("❌ FATAL: Could not download all data after maximum retries.")
+            logger.critical("   Cannot safely start Dashboard. Exiting.")
+            sys.exit(1)
         
-        # Wait 5 minutes between each ticker, but not after the last one
-        if i < num_tickers - 1:
-            logger.info(f"[Setup] Waiting {HISTORICAL_DELAY_SECONDS}s ({HISTORICAL_DELAY_SECONDS // 60} min) for rate limit safety...")
-            for _ in range(HISTORICAL_DELAY_SECONDS):
-                if STOP_EVENT.is_set():
-                    return
-                sleep(1)
+        logger.warning(f"⚠️ Missing historical data for: {missing_tickers}. Starting Retry Round {attempt_count}/{MAX_RETRIES}...")
+        
+        # Fetch missing tickers with a delay between them
+        for i, ticker in enumerate(missing_tickers):
+            if STOP_EVENT.is_set(): return
             
-    logger.info("Initial data fetch complete.")
-    logger.info("="*50)
+            logger.info(f"[Retry Round {attempt_count}] Fetching {ticker}...")
+            fetch_and_save_initial_data(ticker, cfg, data_dir)
+
+            # Rate limit wait (Skip if it's the last ticker in this specific list)
+            if i < len(missing_tickers) - 1:
+                logger.info(f"⏳ Waiting {retry_delay}s before next ticker...")
+                for _ in range(retry_delay):
+                    if STOP_EVENT.is_set(): return
+                    sleep(1)
+        
+        # Cooldown between entire rounds if any tickers failed
+        if missing_tickers:
+            # We must wait 5 minutes before restarting the loop/check
+            logger.info(f"⏳ Waiting {retry_delay}s before checking status for next retry round...")
+            sleep(retry_delay)
 
 
 # =====================================================
@@ -220,6 +232,13 @@ if __name__ == "__main__":
     if STOP_EVENT.is_set():
         logger.info("Shutdown requested during setup. Exiting.")
         sys.exit(0)
+
+    # --- NEW STEP: Final Mandatory Cooldown Before Live Start ---
+    FINAL_COOLDOWN = 300 # 5 minutes
+    logger.info(f"🎯 Historical setup complete. Waiting {FINAL_COOLDOWN}s before first LIVE burst...")
+    for _ in range(FINAL_COOLDOWN):
+        if STOP_EVENT.is_set(): break
+        sleep(1)
 
     # --- STEP 2: Launch all three main services ---
     scripts = [
