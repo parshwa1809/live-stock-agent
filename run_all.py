@@ -75,9 +75,12 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
             logger.warning(f"[Setup] No initial data returned for {ticker}")
             return
 
-        # YFinance returns a simple DataFrame for a single ticker, no MultiIndex
-        # --- NEW: Robust Column Canonicalization ---
-        # 1. Normalize columns to Title Case (e.g., 'open' -> 'Open', 'Open' -> 'Open')
+        # --- NEW ROBUSTNESS FIX: Handle MultiIndex returned by YFinance for single ticker ---
+        if isinstance(df_ticker.columns, pd.MultiIndex):
+            # Drop the outer level (which is usually the redundant ticker name)
+            df_ticker.columns = df_ticker.columns.droplevel(0)
+            
+        # 1. Normalize columns to Title Case (e.g., 'close' -> 'Close')
         df_ticker.columns = df_ticker.columns.str.capitalize()
         # 2. Drop rows with no price (This should now work because 'Close' is capitalized)
         df_ticker = df_ticker.dropna(subset=['Close']) 
