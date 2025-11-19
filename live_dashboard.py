@@ -3,11 +3,13 @@
 Unified Live Stock Dashboard — Phase 2 (FINAL STABLE VERSION)
 
 Features:
-- **FILE STRUCTURE (NEW):** Reads the single unified <TICKER>.csv file.
+- **FILE STRUCTURE:** Reads the single unified <TICKER>.csv file.
 - **STATISTICS:** Dashboard seamlessly uses the single 5-minute file for both
   historical (long-term) charts and live (intraday) charts via time filtering.
 - **ALL ALERTS & NEWS:** All alert types (Live 5-Min, Hist 30-Min, News)
   are fully functional and displayed in the UI.
+- **SMART CHAT:** Context-aware RAG that handles vague affirmations ("Yes") and 
+  specific overrides ("Analyze Apple") intelligently.
 """
 
 import os
@@ -29,6 +31,7 @@ import pytz
 from config import cfg 
 from phase2_pipeline import llm 
 
+# Cache setup (Note: Background callbacks disabled for Mac stability, but cache remains)
 cache = diskcache.Cache("./cache", timeout=120) 
 long_callback_manager = DiskcacheManager(cache) 
 
@@ -127,13 +130,12 @@ def search_rag_index(query: str, k=3) -> str:
         return "Error searching RAG index."
 
 # =====================================================
-# LOAD CSV & GET COLUMN HELPERS (MODIFIED)
+# LOAD CSV & GET COLUMN HELPERS
 # =====================================================
 def load_data(ticker: str) -> pd.DataFrame:
     """
-    Loads the single unified <TICKER>.csv file (file_suffix argument is obsolete).
+    Loads the single unified <TICKER>.csv file.
     """
-    # CRITICAL FIX: Load the unified file <TICKER>.csv
     path = DATA_PATH / f"{ticker}.csv"
     
     if not path.exists():
@@ -300,7 +302,7 @@ app.layout = html.Div([
 
 
 # =====================================================
-# CALLBACK: Ticker Cards & Global Data Store Update (MASTER CALLBACK - MODIFIED)
+# CALLBACK: Ticker Cards & Global Data Store Update (MASTER CALLBACK)
 # =====================================================
 @callback(
     Output("ticker-cards", "children"),
@@ -318,7 +320,6 @@ def update_cards_and_global_stores(n):
     live_data_store = {}
     
     for t in cfg.ALL_FETCH_TICKERS:
-        # CRITICAL FIX: Load the single unified file
         df_unified = load_data(t)
         
         if not df_unified.empty:
@@ -346,10 +347,10 @@ def update_cards_and_global_stores(n):
         # --- FIX: Use DST-aware RTH filter for live cards ---
         if not df_live.empty:
             df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
+            # CRITICAL FIX: Use .iloc for integer indexing from indexer_between_time
             df_rth = df_live.iloc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
         else:
             df_rth = pd.DataFrame()
-        # --- END FIX ---
         
         close = get_col(df_rth, t, "Close")
         vol = get_col(df_rth, t, "Volume", fill_na=0)
@@ -393,7 +394,7 @@ def update_cards_and_global_stores(n):
 
 
 # =====================================================
-# CALLBACK: Historical Charts (MODIFIED for Resampling)
+# CALLBACK: Historical Charts
 # =====================================================
 @callback(
     Output("price-chart-hist", "figure"),
@@ -519,7 +520,8 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
         
     df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
     # Use the eastern timezone index to filter between 9:30 AM and 4:00 PM
-    df_rth = df_live.loc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
+    # CRITICAL FIX: Use .iloc for integer indexing from indexer_between_time
+    df_rth = df_live.iloc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
     # --- END CRITICAL FIX ---
     
     # --- CRITICAL UX FIX: Only check for data sufficiency *after* filtering ---
@@ -588,13 +590,17 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
     
     # 5. CHART UPDATES (Show last 30 5-min candles)
     df_chart_data = df_rth.tail(30).copy() 
+    # --- CRITICAL TIMEZONE FIX: Convert index to Eastern Time for display ---
+    df_chart_data.index = df_chart_data.index.tz_convert(EASTERN_TZ)
+    # ------------------------------------------------------------------------
+
     close = get_col(df_chart_data, ticker, "Close")
     vol_series = get_col(df_chart_data, ticker, "Volume", fill_na=0) 
 
     price_fig = go.Figure()
     if not close.empty:
         price_fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close"))
-        price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last {len(close)} Candles)", xaxis_title="Time", yaxis_title="Price", template="plotly_white")
+        price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last {len(close)} Candles)", xaxis_title="Time (ET)", yaxis_title="Price", template="plotly_white")
     else:
         price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last 30 Candles)", template="plotly_white", annotations=[{"text": "No RTH Price Data Yet", "showarrow": False}])
 
@@ -605,7 +611,7 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
         vol_fig.add_trace(go.Bar(x=vol_series.index, y=vol_series, name=f"Volume ({ticker})"))
         vol_fig.update_layout(
             title=chart_title,
-            xaxis_title="Time",
+            xaxis_title="Time (ET)",
             yaxis_title="Volume",
             yaxis=dict(type="linear", autorange=True),
             template="plotly_white"
@@ -618,7 +624,7 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
 
 
 # =====================================================
-# CHAT LOGIC (Unchanged)
+# CHAT LOGIC (Smart Context & Fast Reply)
 # =====================================================
 @callback(
     Output("llm-response", "children"),
@@ -643,19 +649,37 @@ def update_chat_display(chat_history):
     Input("llm-send", "n_clicks"),
     State("llm-prompt", "value"),
     State("chat-history-store", "data"),
-    background=True, 
+    State("ticker-dropdown", "value"), # <--- Added Ticker State for Context Awareness
+    # background=True, # DISABLED to prevent Mac/Ollama background worker freeze
     prevent_initial_call=True
 )
-def chat_llm(n_clicks, prompt, chat_history): 
+def chat_llm(n_clicks, prompt, chat_history, current_ticker): 
     if not prompt:
         return chat_history, ""
 
     new_history = chat_history + [{"role": "user", "content": prompt}]
 
+    # --- ⚡ OPTIMIZATION 1: Skip RAG for short greetings ---
+    if len(prompt.split()) < 4 and prompt.lower().strip(".,!") in ["hi", "hello", "thanks", "thank you", "hey"]:
+        fast_reply = f"Hello! I am analyzing data for **{current_ticker}**. How can I help you?"
+        return new_history + [{"role": "assistant", "content": fast_reply}], ""
+
+    # --- ⚡ SMART CONTEXT SWITCH ---
+    # Problem: Searching for "Yes" returns random garbage.
+    # Solution: If the prompt is vague, search for the CURRENT TICKER instead.
+    search_query = prompt
+    vague_phrases = ["yes", "yeah", "yep", "sure", "go on", "tell me more", "continue", "elaborate", "explain"]
+    
+    if prompt.lower().strip(".,!?") in vague_phrases:
+        # User said "Yes", so we fetch data for the CURRENT TICKER
+        search_query = f"Latest news and technical analysis for {current_ticker}"
+        logger.info(f"Chat: Swapped vague query '{prompt}' for specific context '{search_query}'")
+
+    # Execute Search
+    retrieved_context = search_rag_index(search_query, k=3)
+    
     history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in new_history])
 
-    retrieved_context = search_rag_index(prompt, k=3)
-    
     payload = f"""
 System: You are a professional, friendly, and highly efficient financial analyst for a stock dashboard.
 Your goal is to provide clear, direct, and non-redundant answers to the investor.
@@ -676,7 +700,7 @@ RULES:
 13. **VOLUME CONTEXT:** When discussing volume, frame it in terms of liquidity or investor interest relative to typical trading activity, rather than just listing the number.
 14. **TREND TIMELINE:** When describing a trend (bullish/bearish), specify if it is a short-term (last 5-20 periods) or long-term trend based on the MA analysis in the context.
 15. **NO GENERIC CHAT:** Do not engage in conversational chitchat or respond to greetings/farewells unless they are part of a substantive question.
-16. **STRICT CONTEXT FILTER:** The primary focus of the current discussion is: [IDENTIFY THE TICKER FROM HISTORY]. Use this focus to strictly prioritize and filter context before generating the answer. Ignore data related to other tickers unless specifically asked for comparison.
+16. **CONTEXT PRIORITY:** The user is currently viewing {current_ticker} on the dashboard. Treat this as the default topic if the user's question is vague (e.g., "Yes", "Explain"). HOWEVER, if the user explicitly asks about a different ticker (e.g., "Analyze Apple"), you MUST prioritize the user's direct question and the retrieved data over the dashboard selection.
 17. **IF HOOK ANSWERED:** If the user affirms the hook (Rule 6) and you have provided the elaboration, ask a new, generic follow-up question (e.g., "What other ticker would you like to review?") to conclude the specific thread.
 
 Conversation History:

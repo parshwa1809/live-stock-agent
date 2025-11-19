@@ -1,13 +1,10 @@
 
-### Updated `Readme.md`
 
-📈 Live Stock Analysis Agent (Phase 2) — Project Summary & RAG Architecture
-
-1.  Project Objective
+## 1. Project Objective
 
 This project is a multi-service application that fetches live stock prices (5-minute level), processes historical logs using Retrieval-Augmented Generation (RAG), and generates natural-language explanations using an LLM. It successfully integrates LLMs with real-world, time-series data to deliver insights and provide multi-factor alert notifications via a live web dashboard.
 
-2.  Core Features
+## 2. Core Features
 
 | Feature | Description |
 | :--- | :--- |
@@ -18,7 +15,7 @@ This project is a multi-service application that fetches live stock prices (5-mi
 | 💬 **LLM-Powered Insights** | Generates natural-language explanations of stock trends, anomalies, and movements. |
 | 🖥️ **Stateless & Non-Blocking UI** | Features a **stateless** Dash UI (using `dcc.Store`) for visualization and scalability. The RAG chat is **non-blocking** (uses `background=True`) and displays Key Live Technical Indicators (RSI, VWAP) pre-calculated by the pipeline. |
 
-3.  Technology Stack
+## 3. Technology Stack
 
 | Category | Components |
 | :--- | :--- |
@@ -35,13 +32,13 @@ This project is a multi-service application that fetches live stock prices (5-mi
 
 ## 🚀 Getting Started
 
-**Prerequisites**
+### Prerequisites
 
-  * **Conda:** Install the Conda package manager.
-  * **Ollama:** Ensure the Ollama service is running locally, and the model specified in your `.env` file (`phi3:mini` by default) is downloaded.
-  * **API Key (CRITICAL\!):** The pipeline requires an external key for news data.
+* **Conda:** Install the Conda package manager.
+* **Ollama:** Ensure the Ollama service is running locally, and the model specified in your `.env` file (`phi3:mini` by default) is downloaded.
+* **API Key (CRITICAL!):** The pipeline requires an external key for news data.
 
-1.  Repository & Environment Setup
+### 1. Repository & Environment Setup
 
 Create a file named `.gitignore` in the root directory:
 
@@ -111,7 +108,7 @@ conda env create -f environment.yml
 conda activate stock_env
 ```
 
-2.  Execution
+### 2\. Execution
 
 Run the master launcher script. This single command handles the one-time initial data fetch (if needed) and starts all three services.
 
@@ -121,30 +118,37 @@ python run_all.py
 
 **Note on Initial Data Fetch (CRITICAL UPDATE):**
 
-The first time you run this, the system will initiate an **Ultra-Safe Serial Fetch** for 30 days of 5-minute data for each of your 8 tickers. To prevent immediate API blocks, the system enforces a **5-minute delay** between fetching **each individual ticker**.
+The first time you run this, the system will initiate an **Ultra-Safe Strict Serial Fetch** for 30 days of 5-minute data for each of your tickers.
 
-  * This process bypasses the old batching method entirely.
-  * **Total Setup Time:** This initial fetch will take approximately **35-40 minutes** to complete before any services are launched.
-  * **Immediate Dashboard Population:** The pipeline is configured to **process alerts and build the RAG index immediately** after startup, ensuring the dashboard is populated with historical data and initial context right away.
-  * *Subsequent runs will skip this initial fetch entirely and proceed directly to launching services.*
+  * **Strict Retry Logic:** To prevent incomplete data, the setup enters a blocking loop. If any ticker fails to download (e.g., due to rate limits), it will **automatically retry** indefinitely (or up to a max retry limit) until the file is successfully created.
+  * **Rate Limiting:** It enforces a **5-minute delay** between fetching each individual ticker.
+  * **Total Setup Time:** This initial fetch will take approximately **35-40 minutes** to complete.
+  * **Final Cooldown:** Once all data is secured, the system waits a final 5 minutes before launching the dashboard to ensure API safety.
+  * *Subsequent runs will skip this initial fetch entirely if the data files exist.*
 
 **Approximate Initialization Time (No Data):**
 
-| Phase | Time | Details | |
-| :--- | :--- | :--- | :--- |
-| **Initial Serial Data Fetch** | $\approx$ **35 - 40 minutes** | Fetching 8 tickers with mandatory 5-minute cooldowns between batches. | Done by `run_all.py` |
-| **System Cooldown** | **5 minutes** | Mandatory pause after the final historical fetch batch before launching services. | Done by `run_all.py` |
-| **Dashboard/RAG Ready** | **Immediate** | Dashboard loads historical charts, RAG index, and initial alerts right away. | Done by `phase2_pipeline.py` |
-| **First Live Fetch Cycle** | **5 minutes** | The pipeline's first full cycle, which updates and appends the latest 5-minute bar to the unified file. | Done by `phase2_pipeline.py` |
-| **Total Time to Full Data** | $\approx$ **45 - 50 minutes** | Time until the dashboard is fully populated with live data and a functioning chatbot. | |
+| Phase | Time | Details |
+| :--- | :--- | :--- |
+| **Initial Serial Data Fetch** | $\approx$ **35 - 40 minutes** | Fetching 8 tickers with mandatory 5-minute cooldowns between batches. |
+| **System Cooldown** | **5 minutes** | Mandatory pause after the final historical fetch batch before launching services. |
+| **Dashboard/RAG Ready** | **Immediate** | Dashboard loads historical charts, RAG index, and initial alerts right away. |
+| **First Live Fetch Cycle** | **5 minutes** | The pipeline's first full cycle, which updates and appends the latest 5-minute bar to the unified file. |
+| **Total Time to Full Data** | $\approx$ **45 - 50 minutes** | Time until the dashboard is fully populated with live data and a functioning chatbot. |
 
-3.  Access the Dashboard
+### 3\. Access the Dashboard
 
 Once the services are running, open your web browser to:
 
 👉 `http://127.0.0.1:8050`
 
-4.  Shutdown
+> **🕒 Time Zone Visualization Note:**
+> The stock data is processed and stored internally in **UTC** to maintain consistency across all services. Consequently, **the charts on the dashboard display timestamps in UTC.**
+> Users in other time zones (e.g., CST/EST) should account for the time difference when viewing live candles.
+>
+>   * *Example:* Market Open (09:30 EST / 08:30 CST) = **14:30 UTC**.
+
+### 4\. Shutdown
 
 Press `Ctrl+C` in the terminal running `run_all.py`. The master script will gracefully terminate all three child processes.
 
@@ -163,11 +167,11 @@ The project is structured around three independent services managed by `run_all.
 
   * **Purpose:** The single, intelligent entry point for the local environment. It manages the initial setup and life cycle of the three core services.
   * **Flow:**
-    1.  **Initial Fetch (CRITICAL):** Checks if the unified `<TICKER>.csv` file exists. If not, runs a **SERIALLY THROTTLED FETCH** for 30 days of 5-minute data, enforcing a **5-minute delay between each of the 8 tickers** to ensure API safety.
+    1.  **Strict Initial Fetch:** Checks if the unified `<TICKER>.csv` file exists. If not, runs a **SERIALLY THROTTLED FETCH** for 30 days of 5-minute data. It includes a **retry loop** that prevents the dashboard from starting until *all* data files are verified.
     2.  **Service Launch:** Uses `subprocess` and `threading` to launch `phase2_pipeline.py`, `build_vector_index.py`, and `live_dashboard.py`.
     3.  **Shutdown:** Implements robust `SIGINT`/`SIGTERM` handling to ensure all child processes are terminated cleanly upon exit.
 
-📊 Data Pipeline and Indexing
+### 📊 Data Pipeline and Indexing
 
 **`phase2_pipeline.py` (Data Ingestion Service)**
 
@@ -198,7 +202,7 @@ The project is structured around three independent services managed by `run_all.
 | **Key Components** | `SentenceTransformer` for embeddings. `faiss` for vector search. `pandas-ta` for technical analysis. Indexes all tickers including SPY and ^VIX for full context. |
 | **Local Limitation** | Inefficient full index rebuild process and dependency on local file I/O for the index files. Becomes slow as historical data grows. |
 
-💻 Dashboard and Chatbot
+### 💻 Dashboard and Chatbot
 
 **`live_dashboard.py` (Web UI/API Gateway)**
 
@@ -210,7 +214,7 @@ The project is structured around three independent services managed by `run_all.
 | **RAG Chatbot Logic** | Uses `search_rag_index` to retrieve semantic context. This function is **self-healing** and automatically reloads the RAG index if it detects a newer version on disk. It sends history and context to the Ollama LLM using a strict, 17-rule system prompt. |
 | **Performance** | **FIXED:** The `chat_llm` callback runs as a Dash **background callback** (`background=True`), preventing the UI from freezing while the local LLM generates a response. |
 
-💡 LLM & RAG Capabilities
+## 💡 LLM & RAG Capabilities
 
 The agent's "intelligence" comes from combining both historical and real-time data to answer user queries.
 
@@ -226,7 +230,7 @@ The agent's "intelligence" comes from combining both historical and real-time da
   * **Dashboard:** An interactive dashboard displays current prices, historical trends, the LLM-generated explanations, and live alerts.
   * **Insights:** The system delivers volatility analysis, trend patterns, and anomaly detection.
 
-☁️ Future Optimization: Cloud Deployment & Microservices
+## ☁️ Future Optimization: Cloud Deployment & Microservices
 
 The current single-machine architecture can be refactored into three distinct Microservices for improved scalability, resilience, and independent deployment in a cloud environment (e.g., AWS, GCP).
 
@@ -246,7 +250,7 @@ The current single-machine architecture can be refactored into three distinct Mi
   * **LLM Infrastructure:** Deploy Ollama as a dedicated, GPU-accelerated service or use a managed LLM provider for fast, scalable inference.
   * **API Communication:** Implement gRPC for low-latency, internal service-to-service communication between the microservices.
 
-📚 References
+### 📚 References
 
   * yfinance: `https://pypi.org/project/yfinance/`
   * Dash: `https://dash.plotly.com/`
