@@ -7,15 +7,13 @@ import json
 from pathlib import Path
 import logging
 import os
-from dotenv import load_dotenv
 import time 
 import signal 
 import sys
 import threading
 
-# --- Configuration ---
-load_dotenv()
-from phase2_pipeline import cfg 
+# --- Configuration FIX: Import from centralized file ---
+from config import cfg 
 
 DATA_DIR = Path(cfg.DATA_DIR)
 TICKERS = cfg.TICKERS
@@ -30,9 +28,6 @@ INDEX_FILE_TMP = DATA_DIR / "stock_index.faiss.tmp"
 TEXTS_FILE_TMP = DATA_DIR / "stock_texts.json.tmp"
 NEWS_JSON_FILE = DATA_DIR / "news_headlines.json"
 REBUILD_INTERVAL_SECONDS = 900 # 15 minutes
-
-RTH_START = '14:30'
-RTH_END = '21:00'
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
@@ -165,7 +160,7 @@ def create_single_smart_chunk(row: pd.Series, ticker: str, period_name: str) -> 
                 f"Would you like me to explain what this combination of trend and momentum means for the stock?"
             )
     else:
-        if ticker == '^VVIX':
+        if ticker == '^VIX':
             analysis_text = "Analysis: VIX analysis focuses on volatility and risk sentiment, not standard price trends."
             hook_text = "Insight/Hook: The VIX level is critical for overall market risk assessment. Would you like to know what the current VIX level implies for market stability?"
         elif ticker not in TICKERS:

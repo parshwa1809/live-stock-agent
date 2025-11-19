@@ -7,20 +7,13 @@ from threading import Lock
 from typing import List, Dict
 from pathlib import Path
 import os 
-import re # Import regex for better word matching
+import re 
 
 logger = logging.getLogger("sentiment_signals")
 
-# --- Define file path for news data ---
-try:
-    from phase2_pipeline import cfg
-    DATA_PATH = Path(cfg.DATA_DIR)
-except ImportError:
-    DATA_PATH = Path("./data")
-
-NEWS_JSON_FILE = DATA_PATH / "news_headlines.json"
-NEWS_JSON_FILE_TMP = DATA_PATH / "news_headlines.json.tmp"
-
+# --- Define file path for news data (MODIFIED: Remove dependency on phase2_pipeline) ---
+NEWS_JSON_FILE_NAME = "news_headlines.json"
+NEWS_JSON_FILE_TMP_NAME = "news_headlines.json.tmp"
 
 # --- Global Cache and Lock ---
 SENTIMENT_CACHE: Dict[str, dict] = {}
@@ -45,11 +38,19 @@ def analyze_sentiment(title: str) -> float:
             
     return score 
 
-def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str):
+# --- MODIFIED SIGNATURE: Now accepts data_dir ---
+def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str, data_dir: str):
     """
     Fetches *financially-relevant* news headlines (from all domains), 
     saves them atomically, and updates the sentiment cache.
     """
+    
+    # --- NEW: Define paths based on passed argument ---
+    data_path = Path(data_dir)
+    news_json_file = data_path / NEWS_JSON_FILE_NAME
+    news_json_file_tmp = data_path / NEWS_JSON_FILE_TMP_NAME
+    # --- END NEW ---
+
     if not api_key or api_key == "YOUR_NEWS_API_KEY":
         logger.warning("Sentiment: Skipping fetch. NEWS_API_KEY not configured. Please update .env.")
         return
@@ -63,17 +64,12 @@ def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str):
     # 3. Combine them
     smart_query = f"{ticker_query} AND {financial_keywords}"
     
-    # --- FIX: Removed the restrictive domain filter to broaden the search ---
-    # smart_domains = "reuters.com,bloomberg.com,marketwatch.com,wsj.com,finance.yahoo.com,cnbc.com"
-    # --- END FIX ---
-    
     headers = {'X-Api-Key': api_key}
     params = {
         'q': smart_query,
-        # 'domains': smart_domains, # <-- This filter is now removed
         'language': 'en',
         'sortBy': 'publishedAt',
-        'pageSize': 100 # <-- FIX: Changed from 20 to 100
+        'pageSize': 100 
     }
     
     logger.info(f"Sentiment: Fetching relevant financial news with query: {smart_query}...")
@@ -90,17 +86,17 @@ def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str):
         new_cache = {}
         articles = data.get('articles', [])
         
-        # --- Atomic Write to prevent race conditions ---
+        # --- Atomic Write to prevent race conditions (UPDATED PATHS) ---
         if articles:
             try:
                 # 1. Write to the temporary file first
-                with open(NEWS_JSON_FILE_TMP, 'w', encoding='utf-8') as f:
+                with open(news_json_file_tmp, 'w', encoding='utf-8') as f:
                     json.dump(articles, f, indent=2)
                 
                 # 2. Atomically rename/move the file
-                os.replace(NEWS_JSON_FILE_TMP, NEWS_JSON_FILE)
+                os.replace(news_json_file_tmp, news_json_file)
                 
-                logger.info(f"Sentiment: Successfully saved {len(articles)} headlines to {NEWS_JSON_FILE}")
+                logger.info(f"Sentiment: Successfully saved {len(articles)} headlines to {news_json_file}")
             except Exception as e:
                 logger.error(f"Sentiment: Failed to save news JSON file: {e}")
         # --- END Atomic Write ---
@@ -156,7 +152,7 @@ def compute_signals(ticker: str) -> tuple[list[str], dict]:
         2. indicators (dict): An empty dictionary (for API consistency).
     """
     alerts = []
-    indicators = {} # <-- NEW: Empty dict for consistent return signature
+    indicators = {} 
     
     with CACHE_LOCK:
         data = SENTIMENT_CACHE.get(ticker)

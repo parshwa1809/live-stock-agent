@@ -25,8 +25,8 @@ import math
 # --- Import key components from the pipeline itself ---
 import yfinance as yf
 import pandas as pd
-# We import Config from the pipeline module
-from phase2_pipeline import Config 
+# FIX: Import Config from the new centralized file
+from config import cfg, Config 
 
 # -----------------------
 # Logging setup
@@ -117,9 +117,9 @@ def run_initial_data_fetch():
     logger.info("="*50)
     logger.info("Checking for required unified data files...")
     
-    # Need to load config first
-    load_dotenv()
-    cfg = Config()
+    # Need to load config first (now handled by centralized import)
+    # load_dotenv() # Removed
+    # cfg = Config() # Removed
     data_dir = Path(cfg.DATA_DIR)
     data_dir.mkdir(parents=True, exist_ok=True)
     

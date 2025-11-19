@@ -1,12 +1,15 @@
 import pandas as pd
 from datetime import datetime, time, timedelta
 import logging
+import pytz # <-- NEW IMPORT
 
 logger = logging.getLogger("calendar_signals")
 
-# Define Regular Trading Hours (RTH) in UTC
-RTH_OPEN = time(14, 30, 0) # 9:30 AM EST
-RTH_CLOSE = time(21, 0, 0) # 4:00 PM EST
+# Define timezone and RTH in local time (EST/EDT)
+EASTERN_TZ = pytz.timezone('America/New_York')
+
+RTH_OPEN = time(9, 30, 0) 
+RTH_CLOSE = time(16, 0, 0) 
 
 def compute_signals(df: pd.DataFrame, ticker: str) -> tuple[list[str], dict]:
     """
@@ -22,23 +25,26 @@ def compute_signals(df: pd.DataFrame, ticker: str) -> tuple[list[str], dict]:
         2. indicators (dict): An empty dictionary (for API consistency).
     """
     alerts = []
-    indicators = {} # <-- NEW: Empty dict for consistent return signature
+    indicators = {} 
     
     if df.empty:
-        return alerts, indicators # <-- Return both
+        return alerts, indicators 
 
     # Use the timestamp of the latest data point
-    latest_timestamp = df.index[-1]
-    latest_time = latest_timestamp.time()
-    latest_day = latest_timestamp.weekday() # Monday is 0, Sunday is 6
+    latest_timestamp_utc = df.index[-1]
+    
+    # CRITICAL FIX: Convert to Eastern Time for RTH checks
+    latest_timestamp_local = latest_timestamp_utc.tz_convert(EASTERN_TZ)
+    latest_time = latest_timestamp_local.time()
+    latest_day = latest_timestamp_local.weekday() 
     
     # 1. Time-of-Day Volatility (First and Last 30 Minutes of RTH)
     
     # Calculate the end time of the opening volatility period
-    open_vol_end = (datetime.combine(datetime.min, RTH_OPEN) + timedelta(minutes=30)).time()
+    open_vol_end = (datetime.combine(datetime.min, RTH_OPEN, tzinfo=EASTERN_TZ) + timedelta(minutes=30)).time()
     
     # Calculate the start time of the closing volatility period
-    close_vol_start = (datetime.combine(datetime.min, RTH_CLOSE) - timedelta(minutes=30)).time()
+    close_vol_start = (datetime.combine(datetime.min, RTH_CLOSE, tzinfo=EASTERN_TZ) - timedelta(minutes=30)).time()
     
     if RTH_OPEN <= latest_time <= open_vol_end:
         alerts.append("Market Open Volatility: Expect high liquidity and price swings.")

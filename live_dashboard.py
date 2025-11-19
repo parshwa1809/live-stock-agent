@@ -24,8 +24,10 @@ import json
 from pathlib import Path 
 import faiss
 from sentence_transformers import SentenceTransformer
+import pytz # <-- NEW IMPORT for DST fix
 
-from phase2_pipeline import cfg, llm 
+from config import cfg # <-- FIX: Import config
+from phase2_pipeline import llm # <-- Import LLM only
 
 cache = diskcache.Cache("./cache", timeout=120) 
 long_callback_manager = DiskcacheManager(cache) 
@@ -37,9 +39,10 @@ logger = logging.getLogger("live_dashboard")
 app = Dash(__name__, background_callback_manager=long_callback_manager) 
 server = app.server
 
-# Define Regular Trading Hours (RTH) in UTC
+# Define Regular Trading Hours (RTH) in UTC for historical purposes
 RTH_START = '14:30'
 RTH_END = '21:00'
+EASTERN_TZ = pytz.timezone('America/New_York') # <-- NEW: Define TZ
 
 # =====================================================
 # RAG: Load models and index globally for performance 
@@ -340,10 +343,13 @@ def update_cards_and_global_stores(n):
             except Exception as e:
                 logger.error(f"Failed to read live data from store for {t}: {e}")
 
+        # --- FIX: Use DST-aware RTH filter for live cards ---
         if not df_live.empty:
-            df_rth = df_live.between_time(RTH_START, RTH_END)
+            df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
+            df_rth = df_live.loc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
         else:
             df_rth = pd.DataFrame()
+        # --- END FIX ---
         
         close = get_col(df_rth, t, "Close")
         vol = get_col(df_rth, t, "Volume", fill_na=0)
@@ -455,7 +461,7 @@ def update_hist_charts(ticker, hist_data_json, hist_alerts_dict):
 
 
 # =====================================================
-# CALLBACK: "Live" Charts (Unchanged logic, uses unified store)
+# CALLBACK: "Live" Charts (FIXED RTH LOGIC)
 # =====================================================
 @callback(
     Output("price-chart-live", "figure"),
@@ -510,8 +516,11 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
         empty_fig = go.Figure().update_layout(template="plotly_white", title="Not enough data for live charts/indicators (need 21 periods).")
         return empty_fig, empty_fig, "Waiting for pipeline data...", html.P("Not enough data to compute key indicators.", style={"textAlign": "center"}), news_elements
 
-    # Use existing RTH filter on the full 5-min data
-    df_rth = df_live.between_time(RTH_START, RTH_END)
+    # --- CRITICAL FIX: Use TZ conversion for RTH filter (Fixes DST bug) ---
+    df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
+    # Use the eastern timezone index to filter between 9:30 AM and 4:00 PM
+    df_rth = df_live.loc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
+    # --- END CRITICAL FIX ---
     
     if df_rth.empty or len(df_rth) < 21:
         empty_fig = go.Figure().update_layout(template="plotly_white", title="Market Closed or No RTH Data (need 21 data points).")

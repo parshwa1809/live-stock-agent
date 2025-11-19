@@ -21,7 +21,6 @@ import requests
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
-from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 import signal
@@ -29,40 +28,10 @@ import math
 import requests.exceptions 
 import random 
 
-# --- Configuration ---
-load_dotenv()
+# --- Configuration FIX: Import Config from centralized file ---
+from config import cfg
 
-class Config:
-    TICKERS = os.getenv("TICKERS", "AAPL,AMZN,GOOGL,MSFT,TSLA").split(",")
-    DATA_DIR = os.getenv("DATA_DIR", "./data")
-    # --- Live loop runs every 5 minutes (300s) for the strict single-call requirement ---
-    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 300)) 
-    
-    CONTEXT_TICKERS = ["SPY", "QQQ", "^VIX"] 
-    ALL_FETCH_TICKERS = list(set(TICKERS) | set(CONTEXT_TICKERS))
-    
-    # Batch size is for the *historical* fetch in run_all.py
-    TICKER_BATCH_SIZE = int(os.getenv("TICKER_BATCH_SIZE", 8)) 
-
-    CSV_RETENTION_DAYS = int(os.getenv("CSV_RETENTION_DAYS", 30))
-    OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "phi3:mini")
-    OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    
-    NEWS_API_KEY = os.getenv("NEWS_API_KEY", "YOUR_NEWS_API_KEY") 
-    NEWS_API_URL = "https://newsapi.org/v2/everything" 
-    NEWS_REFRESH_INTERVAL = int(os.getenv("NEWS_REFRESH_INTERVAL", 600))
-    
-    # --- Rate Limit Defense ---
-    EMERGENCY_COOLDOWN = int(os.getenv("EMERGENCY_COOLDOWN", 1800)) # 1800 seconds = 30 minutes
-    
-    # --- Proxy Configuration ---
-    PROXIES = [] 
-
-
-cfg = Config()
-
-# --- *** FIX 1: Imports moved here to prevent circular dependency *** ---
+# --- FIX: Imports moved here to prevent circular dependency ---
 import signals.technical as technical
 import signals.volume as volume
 import signals.market_context as market_context
@@ -70,17 +39,15 @@ import signals.calendar as calendar
 import signals.sentiment as sentiment 
 # --- END FIX ---
 
-# --- POTENTIAL BUG FIX: Use the configured DATA_DIR ---
+# --- Use the configured DATA_DIR ---
 DATA_DIR_PATH = Path(cfg.DATA_DIR)
 # --- END FIX ---
 DATA_DIR_PATH.mkdir(parents=True, exist_ok=True)
-# --- NEW: Define the alerts output file ---
 ALERTS_JSON_FILE = DATA_DIR_PATH / "live_alerts.json"
 
-# --- FIX: Moved RTH definitions here to be globally available BEFORE instantiation ---
+# --- RTH definitions remain for local use ---
 RTH_START = '14:30'
 RTH_END = '21:00'
-# --- END FIX ---
 
 # -----------------------
 # Logging & shutdown 
@@ -102,7 +69,7 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 # -----------------------
-# Ollama LLM interface (Omitted for brevity)
+# Ollama LLM interface (Defined after cfg import)
 # -----------------------
 class LLMInterface:
     def __init__(self, model_name: str = cfg.OLLAMA_MODEL_NAME, url: str = cfg.OLLAMA_API_URL):
@@ -435,18 +402,24 @@ class AlertEngine:
 
         return alerts, indicators
 
-# --- Instances must be created after class definitions ---
-live_tracker = LiveTracker(cfg.TICKERS)
-alert_engine = AlertEngine(cfg, live_tracker) 
+# --- Instances (Now placeholders, initialized in run_forever) ---
+live_tracker = None
+alert_engine = None 
 
 # -----------------------
-# MODIFIED: News/Sentiment Fetcher (Unchanged)
+# MODIFIED: News/Sentiment Fetcher
 # -----------------------
 def news_fetcher_task():
     """ Runs news fetch serially. """
     logger.info(f"Sentiment: Starting news/sentiment fetch...")
     try:
-        sentiment.fetch_news_and_analyze(cfg.TICKERS, cfg.NEWS_API_URL, cfg.NEWS_API_KEY)
+        # --- MODIFIED CALL: Pass DATA_DIR explicitly ---
+        sentiment.fetch_news_and_analyze(
+            cfg.TICKERS, 
+            cfg.NEWS_API_URL, 
+            cfg.NEWS_API_KEY,
+            cfg.DATA_DIR # <-- PASS DATA_DIR
+        )
     except Exception as e:
         logger.error(f"Error in news_fetcher_task: {e}")
     logger.info("Sentiment: News fetch complete.")
@@ -460,6 +433,11 @@ def process_initial_alerts_and_rag():
     logger.info("Running initial historical alert processing for dashboard...")
     all_alerts = {}
     
+    # Must use global alert_engine, which is initialized in run_forever()
+    if alert_engine is None:
+        logger.error("AlertEngine not initialized. Cannot run initial processing.")
+        return
+
     for t in cfg.TICKERS:
         if STOP_EVENT.is_set():
             break
@@ -568,7 +546,15 @@ def process_cycle(run_count: int):
 
 
 def run_forever():
+    global live_tracker, alert_engine 
     
+    # --- CRITICAL FIX: INSTANTIATE OBJECTS HERE ---
+    # This prevents instantiation when other files import phase2_pipeline
+    logger.info("Initializing LiveTracker and AlertEngine...")
+    live_tracker = LiveTracker(cfg.TICKERS)
+    alert_engine = AlertEngine(cfg, live_tracker)
+    # --- END CRITICAL FIX ---
+
     logger.info("Running initial data backfill on startup...")
     try:
         # 1. Run low-risk actions first (News fetch and historical buffer load)
