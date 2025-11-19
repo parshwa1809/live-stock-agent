@@ -1,4 +1,8 @@
+That's a fantastic request. I've updated the `Readme.md` to reflect the final, resilient architecture, including the **Single API Call** strategy, the revised initialization times, and the data storage points.
 
+Here is the updated file:
+
+````markdown
 ### Updated `Readme.md`
 
 📈 Live Stock Analysis Agent (Phase 2) — Project Summary & RAG Architecture
@@ -12,7 +16,7 @@ This project is a multi-service application that fetches live stock prices (5-mi
 | Feature | Description |
 | :--- | :--- |
 | 🚨 **Multi-Factor Alert Engine** | Implements a powerful, five-part modular system that calculates real-time signals based on: Technical Indicators, Volume Metrics, Market Context (SPY, ^VIX), Calendar/Cyclical Patterns, and News Sentiment. |
-| 🌐 **Resilient Data Pipeline** | Uses stable, small batches to fetch 5-minute live data for all tickers. Also features a **self-healing** 30-minute historical backfill that runs every 30 minutes to catch any missing data. |
+| 🌐 **Resilient Data Pipeline** | Uses a **Single Bulk API Call** every 5 minutes to maintain data snapshot consistency. Also features a **self-healing** 30-minute historical backfill that runs every 15 minutes to catch any missing data. |
 | 🗃️ **Atomic & Orchestrated** | All data saves (CSV, JSON, FAISS) are **atomic** (using `os.replace`) to prevent read/write race conditions between services. The news fetch runs *serially* at the start of each cycle to guarantee sentiment data is fresh before alerts are run. |
 | 🧠 **RAG Pipeline** | Implements a full RAG pipeline for time-series data, using historical stock logs as the knowledge base. The RAG index auto-reloads in the dashboard when it detects a newer file. |
 | 💬 **LLM-Powered Insights** | Generates natural-language explanations of stock trends, anomalies, and movements. |
@@ -22,6 +26,7 @@ This project is a multi-service application that fetches live stock prices (5-mi
 
 | Category | Components |
 | :--- | :--- |
+| **Data Storage Point** | **Local `data/` directory** (CSVs, JSONs, FAISS Index) |
 | Data Fetching | yfinance, requests (for News API) |
 | Data Handling | pandas, pandas-ta |
 | Environment | python-dotenv, conda |
@@ -30,15 +35,15 @@ This project is a multi-service application that fetches live stock prices (5-mi
 | Web/UI | dash, plotly, diskcache |
 | Concurrency | subprocess, threading |
 
-🚀 Getting Started
+---
+
+## 🚀 Getting Started
 
 **Prerequisites**
 
   * **Conda:** Install the Conda package manager.
   * **Ollama:** Ensure the Ollama service is running locally, and the model specified in your `.env` file (`phi3:mini` by default) is downloaded.
   * **API Key (CRITICAL\!):** The pipeline requires an external key for news data.
-
-<!-- end list -->
 
 1.  Repository & Environment Setup
 
@@ -64,7 +69,7 @@ data/
 # Conda environment directory
 .venv/
 venv/
-```
+````
 
 Create a file named `.env` in the root directory to configure the pipeline (do NOT commit this file):
 
@@ -74,7 +79,7 @@ Create a file named `.env` in the root directory to configure the pipeline (do N
 TICKERS=AAPL,AMZN,GOOK,MSFT,TSLA
 
 # Refresh interval in seconds (YFinance bulk fetch frequency)
-REFRESH_INTERVAL=600
+REFRESH_INTERVAL=300
 
 # Local data directory (use relative path for portability)
 DATA_DIR=./data
@@ -109,7 +114,16 @@ Run the master launcher script. This single command handles the one-time histori
 python run_all.py
 ```
 
-**Note:** The first time you run this, it will check for 30-day historical data. If missing, it will fetch it in safe, small batches (with delays), which may take several minutes. Subsequent runs will start immediately. The pipeline runs an **immediate** first data fetch on startup, so data should appear within 1-2 minutes.
+**Note:** The first time you run this, it will check for 30-day historical data. If missing, it will fetch it in safe, small batches (with delays), which may take several minutes. Subsequent runs will start immediately. Due to the high-risk nature of the API, the system enforces a **Final Cooldown** after the historical setup.
+
+**Approximate Initialization Time (No Data):**
+
+| Phase | Time | Details |
+| :--- | :--- | :--- |
+| **Historical Data Fetch** | $\approx$ **15 - 20 minutes** | Fetching all 8 tickers with mandatory 5-minute cooldowns between batches. |
+| **System Cooldown** | **5 minutes** | Mandatory pause after the final historical fetch batch before launching services. |
+| **First Live Fetch Cycle** | **5 minutes** | The pipeline's first full cycle, which makes the single bulk API call and generates all live data files. |
+| **Total Time to Full Data** | $\approx$ **25 - 30 minutes** | Time until the dashboard is fully populated with live data and a functioning chatbot. |
 
 3.  Access the Dashboard
 
@@ -121,7 +135,9 @@ Once the services are running, open your web browser to:
 
 Press `Ctrl+C` in the terminal running `run_all.py`. The master script will gracefully terminate all three child processes.
 
-⚙️ Project Architecture (File Breakdown)
+-----
+
+## ⚙️ Project Architecture (File Breakdown)
 
 The project is structured around three independent services managed by `run_all.py`.
 
@@ -145,8 +161,8 @@ The project is structured around three independent services managed by `run_all.
 | Detail | Description |
 | :--- | :--- |
 | **Purpose** | The core data ingestion and alert orchestration service. |
-| **Data Flow** | **Live (5-Min):** Runs every 10 minutes (600s). Fetches 1 day of 5-min data in stable **batches of 2** to avoid rate limits.<br>**Startup:** Runs an *immediate* first fetch, then begins the 10-minute wait cycle. |
-| **Key Feature** | **Self-Healing Backfill:** Every 3rd run (\~30 mins), it also runs a "Smart Incremental Backfill" to heal the 30-min `_hist.csv` files, fetching any missing data. |
+| **Data Flow** | **Live (5-Min):** Runs every 5 minutes (300s). Performs a **SINGLE BULK API CALL** for all tickers to ensure data consistency and minimize request frequency. |
+| **Key Feature** | **Adaptive Cooldown:** If the single bulk fetch fails, the system stalls the next cycle for 30 minutes to reset the aggressive API block. |
 | **Key Components** | `LiveTracker` for managing in-memory data buffers.<br>`AlertEngine` orchestrates calls to the `signals/` directory.<br>`news_fetcher_task` runs **serially** at the start of each cycle to fetch sentiment data *before* alerts are calculated. |
 | **Output** | Saves `_live.csv`, `_hist.csv`, and `live_alerts.json` (with pre-calculated TA) using **atomic writes** (`os.replace`) to prevent read/write conflicts. |
 
@@ -226,3 +242,8 @@ The current single-machine architecture can be refactored into three distinct Mi
   * FAISS: `https://faiss.ai/`
   * sentence-transformers: `https://www.sbert.net/`
   * Dash Diskcache: `https://dash.plotly.com/background-callbacks`
+
+<!-- end list -->
+
+```
+```
