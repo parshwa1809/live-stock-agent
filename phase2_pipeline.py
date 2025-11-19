@@ -208,7 +208,8 @@ def save_unified_csv(df: pd.DataFrame, ticker: str):
 # LiveTracker (MODIFIED for Incremental Update)
 # -----------------------
 class LiveTracker:
-    def __init__(self, tickers):
+    # FIX: Removed the unused 'tickers' argument for code hygiene
+    def __init__(self): 
         self.all_tickers = cfg.ALL_FETCH_TICKERS 
         # Buffers now store the single unified DataFrame per ticker
         self._unified_buffers = {t: pd.DataFrame() for t in self.all_tickers}
@@ -549,9 +550,9 @@ def run_forever():
     global live_tracker, alert_engine 
     
     # --- CRITICAL FIX: INSTANTIATE OBJECTS HERE ---
-    # This prevents instantiation when other files import phase2_pipeline
+    # LiveTracker now takes NO ARGUMENT, relying solely on config.cfg
     logger.info("Initializing LiveTracker and AlertEngine...")
-    live_tracker = LiveTracker(cfg.TICKERS)
+    live_tracker = LiveTracker() # FIXED: Removed cfg.TICKERS argument
     alert_engine = AlertEngine(cfg, live_tracker)
     # --- END CRITICAL FIX ---
 

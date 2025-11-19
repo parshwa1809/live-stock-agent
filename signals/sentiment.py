@@ -59,7 +59,7 @@ def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str, data_
     # 1. Create a keyword filter for *financial* news
     financial_keywords = "(stock OR earnings OR finance OR market OR analyst OR dividend OR shares OR equity OR financial)"
     # 2. Create the query for all tickers
-    ticker_query = f"({' OR '.join(tickers)})"
+    ticker_query = f"({' OR '.join(t.lstrip('^') for t in tickers)})" # FIX: Strip '^' for API query
     
     # 3. Combine them
     smart_query = f"{ticker_query} AND {financial_keywords}"
@@ -108,9 +108,11 @@ def fetch_news_and_analyze(tickers: List[str], api_url: str, api_key: str, data_
                 # Find the primary ticker this article is about
                 target_ticker = None
                 for t in tickers:
-                    # --- NEW: Use regex for whole-word matching (e.g., "TSLA" but not "TSLA-WANNABE") ---
-                    if re.search(r'\b' + re.escape(t) + r'\b', title, re.IGNORECASE):
-                        target_ticker = t
+                    # FIX: Strip '^' for regex search to prevent boundary matching errors
+                    search_term = t.lstrip('^')
+                    # Use regex for whole-word matching (e.g., "TSLA" but not "TSLA-WANNABE")
+                    if re.search(r'\b' + re.escape(search_term) + r'\b', title, re.IGNORECASE):
+                        target_ticker = t # Keep original ticker (e.g., ^VIX) for internal key
                         break
                 
                 if target_ticker:

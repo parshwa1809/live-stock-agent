@@ -24,10 +24,10 @@ import json
 from pathlib import Path 
 import faiss
 from sentence_transformers import SentenceTransformer
-import pytz # <-- NEW IMPORT for DST fix
+import pytz 
 
-from config import cfg # <-- FIX: Import config
-from phase2_pipeline import llm # <-- Import LLM only
+from config import cfg 
+from phase2_pipeline import llm 
 
 cache = diskcache.Cache("./cache", timeout=120) 
 long_callback_manager = DiskcacheManager(cache) 
@@ -42,7 +42,7 @@ server = app.server
 # Define Regular Trading Hours (RTH) in UTC for historical purposes
 RTH_START = '14:30'
 RTH_END = '21:00'
-EASTERN_TZ = pytz.timezone('America/New_York') # <-- NEW: Define TZ
+EASTERN_TZ = pytz.timezone('America/New_York') 
 
 # =====================================================
 # RAG: Load models and index globally for performance 
@@ -461,7 +461,7 @@ def update_hist_charts(ticker, hist_data_json, hist_alerts_dict):
 
 
 # =====================================================
-# CALLBACK: "Live" Charts (FIXED RTH LOGIC)
+# CALLBACK: "Live" Charts (FIXED RTH LOGIC & UX)
 # =====================================================
 @callback(
     Output("price-chart-live", "figure"),
@@ -512,69 +512,79 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
         except Exception as e:
             logger.error(f"Failed to read live data from store for {ticker}: {e}")
 
-    if df_live.empty or len(df_live) < 21:
-        empty_fig = go.Figure().update_layout(template="plotly_white", title="Not enough data for live charts/indicators (need 21 periods).")
-        return empty_fig, empty_fig, "Waiting for pipeline data...", html.P("Not enough data to compute key indicators.", style={"textAlign": "center"}), news_elements
-
     # --- CRITICAL FIX: Use TZ conversion for RTH filter (Fixes DST bug) ---
+    if df_live.empty:
+        empty_fig = go.Figure().update_layout(template="plotly_white", title="No Data Available.")
+        return empty_fig, empty_fig, "Waiting for data...", html.P("No data available.", style={"textAlign": "center"}), news_elements
+        
     df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
     # Use the eastern timezone index to filter between 9:30 AM and 4:00 PM
     df_rth = df_live.loc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
     # --- END CRITICAL FIX ---
     
-    if df_rth.empty or len(df_rth) < 21:
-        empty_fig = go.Figure().update_layout(template="plotly_white", title="Market Closed or No RTH Data (need 21 data points).")
+    # --- CRITICAL UX FIX: Only check for data sufficiency *after* filtering ---
+    if df_rth.empty:
+        empty_fig = go.Figure().update_layout(template="plotly_white", title="Market Closed or No RTH Data Yet.")
         return empty_fig, empty_fig, "Market Closed. No RTH alerts.", html.P("Market Closed or No RTH Data.", style={"textAlign": "center"}), news_elements
 
+    # Determine if we have enough data to calculate indicators (min 21 periods for RSI/BB)
+    sufficient_data_for_indicators = len(df_rth) >= 21
+    
     # 3. Get alerts and indicators from the store
     alerts_list = []
     indicators = {}
     if live_alerts_dict and ticker in live_alerts_dict:
         alerts_list = live_alerts_dict[ticker].get("alerts", [])
-        indicators = live_alerts_dict[ticker].get("indicators", {})
+        # Only use indicators if we have enough data (to align with pipeline logic)
+        if sufficient_data_for_indicators:
+            indicators = live_alerts_dict[ticker].get("indicators", {})
 
     now_str = datetime.now().strftime('%H:%M:%S')
     alerts_text = "\n".join([f"{now_str} - {a}" for a in alerts_list[-20:]]) \
                   if alerts_list else "No RTH alerts yet"
 
     # 4. CALCULATE KEY INDICATORS (on 5-min RTH data)
-    rsi = indicators.get('RSI_14', np.nan)
-    macd_hist = indicators.get('MACDh_12_26_9', np.nan)
-    bb_width_pct = indicators.get('BBB_20_2.0', np.nan)
-    vwap = indicators.get('VWAP', np.nan)
-    latest_close = indicators.get('Close', np.nan)
-    
-    def format_indicator(name, value, unit="", color_logic=None):
-        if pd.isna(value):
-            return html.Div([html.P(name), html.P("N/A", style={"color": "#999"})], style={"textAlign": "center"})
-        display_value = f"{value:.2f}{unit}"
-        color = "#333" 
-        if name == "RSI":
-            display_value = f"{value:.1f}"
-            if value >= 70: color = "red"
-            elif value <= 30: color = "green"
-        elif name == "MACD Hist.":
-            if value > 0.01: color = "green"
-            elif value < -0.01: color = "red"
-        elif name == "VWAP Diff.":
-            display_value = f"{value * 100:.2f}%"
-            if value > 0: color = "green"
-            elif value < 0: color = "red"
-        elif name == "BBand Width %":
-            display_value = f"{value:.2f}%"
-        return html.Div([
-            html.P(name, style={"fontWeight": "bold", "margin": "0"}), 
-            html.P(display_value, style={"color": color, "fontSize": "1.4em", "margin": "5px 0"})
-        ], style={"textAlign": "center"})
+    indicator_elements = []
+    if not sufficient_data_for_indicators:
+         indicator_elements = [html.P("Need 21 data points (approx. 1h 45m after open) for indicators.", style={"textAlign": "center"})]
+    else:
+        rsi = indicators.get('RSI_14', np.nan)
+        macd_hist = indicators.get('MACDh_12_26_9', np.nan)
+        bb_width_pct = indicators.get('BBB_20_2.0', np.nan)
+        vwap = indicators.get('VWAP', np.nan)
+        latest_close = indicators.get('Close', np.nan)
+        
+        def format_indicator(name, value, unit="", color_logic=None):
+            if pd.isna(value):
+                return html.Div([html.P(name), html.P("N/A", style={"color": "#999"})], style={"textAlign": "center"})
+            display_value = f"{value:.2f}{unit}"
+            color = "#333" 
+            if name == "RSI":
+                display_value = f"{value:.1f}"
+                if value >= 70: color = "red"
+                elif value <= 30: color = "green"
+            elif name == "MACD Hist.":
+                if value > 0.01: color = "green"
+                elif value < -0.01: color = "red"
+            elif name == "VWAP Diff.":
+                display_value = f"{value * 100:.2f}%"
+                if value > 0: color = "green"
+                elif value < 0: color = "red"
+            elif name == "BBand Width %":
+                display_value = f"{value:.2f}%"
+            return html.Div([
+                html.P(name, style={"fontWeight": "bold", "margin": "0"}), 
+                html.P(display_value, style={"color": color, "fontSize": "1.4em", "margin": "5px 0"})
+            ], style={"textAlign": "center"})
 
-    vwap_diff = (latest_close - vwap) / vwap if vwap > 0 and not pd.isna(latest_close) else 0
-    
-    indicator_elements = [
-        format_indicator("RSI (14)", rsi),
-        format_indicator("MACD Hist.", macd_hist),
-        format_indicator("BBand Width %", bb_width_pct),
-        format_indicator("VWAP Diff.", vwap_diff)
-    ]
+        vwap_diff = (latest_close - vwap) / vwap if vwap > 0 and not pd.isna(latest_close) else 0
+        
+        indicator_elements = [
+            format_indicator("RSI (14)", rsi),
+            format_indicator("MACD Hist.", macd_hist),
+            format_indicator("BBand Width %", bb_width_pct),
+            format_indicator("VWAP Diff.", vwap_diff)
+        ]
     
     # 5. CHART UPDATES (Show last 30 5-min candles)
     df_chart_data = df_rth.tail(30).copy() 
@@ -584,10 +594,13 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
     price_fig = go.Figure()
     if not close.empty:
         price_fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close"))
-        price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last 30 Candles)", xaxis_title="Time", yaxis_title="Price", template="plotly_white")
+        price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last {len(close)} Candles)", xaxis_title="Time", yaxis_title="Price", template="plotly_white")
+    else:
+        price_fig.update_layout(title=f"{ticker} Live Price (RTH, Last 30 Candles)", template="plotly_white", annotations=[{"text": "No RTH Price Data Yet", "showarrow": False}])
+
 
     vol_fig = go.Figure()
-    chart_title = f"{ticker} Live Volume (RTH, Last 30 Candles)"
+    chart_title = f"{ticker} Live Volume (RTH, Last {len(vol_series)} Candles)"
     if not vol_series.empty:
         vol_fig.add_trace(go.Bar(x=vol_series.index, y=vol_series, name=f"Volume ({ticker})"))
         vol_fig.update_layout(
@@ -597,6 +610,9 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict):
             yaxis=dict(type="linear", autorange=True),
             template="plotly_white"
         )
+    else:
+        vol_fig.update_layout(title=f"{ticker} Live Volume (RTH, Last 30 Candles)", template="plotly_white", annotations=[{"text": "No RTH Volume Data Yet", "showarrow": False}])
+
     
     return price_fig, vol_fig, alerts_text, indicator_elements, news_elements
 
