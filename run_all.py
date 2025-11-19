@@ -25,7 +25,8 @@ import math
 # --- Import key components from the pipeline itself ---
 import yfinance as yf
 import pandas as pd
-from phase2_pipeline import Config
+# We import Config from the pipeline module
+from phase2_pipeline import Config 
 
 # -----------------------
 # Logging setup
@@ -67,7 +68,6 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
     
     try:
         # Fetch the single ticker data
-        # interval="5m" for the new unified file
         df_ticker = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
                              interval="5m", progress=False, group_by='ticker')
         
@@ -76,12 +76,12 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
             return
 
         # YFinance returns a simple DataFrame for a single ticker, no MultiIndex
-        if isinstance(df_ticker.columns, pd.MultiIndex):
-             # Extract the single ticker data if MultiIndex somehow occurs
-             if ticker in df_ticker.columns.get_level_values(1):
-                 df_ticker = df_ticker.xs(ticker, level=1, axis=1)
-
-        df_ticker = df_ticker.dropna(subset=['Close']) # Drop rows with no price
+        # --- NEW: Robust Column Canonicalization ---
+        # 1. Normalize columns to Title Case (e.g., 'open' -> 'Open', 'Open' -> 'Open')
+        df_ticker.columns = df_ticker.columns.str.capitalize()
+        # 2. Drop rows with no price (This should now work because 'Close' is capitalized)
+        df_ticker = df_ticker.dropna(subset=['Close']) 
+        # --- END FIX ---
             
         if df_ticker.empty:
             logger.warning(f"[Setup] No usable data found for {ticker} after cleaning.")
@@ -95,10 +95,7 @@ def fetch_and_save_initial_data(ticker: str, cfg: Config, data_dir: Path):
         # Ensure base columns are saved with suffixes for safety/consistency, 
         # using the convention <Col>_<TICKER>
         for col in ["Open", "High", "Low", "Close", "Volume"]:
-            # Ensure the simple column is present before suffixing (handles potential capitalization)
-            if col not in df_to_save.columns and col.capitalize() in df_to_save.columns:
-                 df_to_save[col] = df_to_save[col.capitalize()]
-
+            # Check for the canonicalized column name
             if col in df_to_save.columns and f"{col}_{ticker}" not in df_to_save.columns:
                 df_to_save[f"{col}_{ticker}"] = df_to_save[col]
         
