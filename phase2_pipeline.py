@@ -1,50 +1,89 @@
 #!/usr/bin/env python3
 """
-phase2_pipeline.py — Phase 2 live stock pipeline (Final Stable Version)
+phase2_pipeline.py — Phase 2 live stock pipeline (FINAL STABLE VERSION)
 
 Features:
-- Creates separate files for historical (30d/30min) and live (1d/1min) data
-- Historical data is bypassed at startup to prevent rate limit crash
-- **FIXED: Live data is updated every 5 minutes using a SINGLE BULK API CALL.**
-- No data mixing, which fixes all chart bugs
+- **DUAL-INTERVAL FETCH:** This pipeline is now fully self-healing and stable.
+- **LIVE (5-Min):** Runs every 5 minutes (300s). Performs a **SINGLE API CALL**
+  for all tickers to strictly limit request frequency. Uses period="1d" for
+  correct yfinance syntax.
+- **HISTORICAL (30-Min):** Every 3rd run (i.e., every 15 mins), it also
+  runs a "Smart Incremental Backfill" to heal the `_hist.csv` (30-min data).
+- **ADAPTIVE COOLDOWN:** If the single live fetch fails due to a rate limit, the
+  pipeline stalls the next cycle for 30 minutes to guarantee the API limit resets.
 """
 
-import os
+import os 
 import time
 import threading
 import logging
 import requests
 import json
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 import signal
+import math
+import requests.exceptions 
+import random 
 
-# -----------------------
-# Config
-# -----------------------
+# --- Configuration ---
 load_dotenv()
 
 class Config:
     TICKERS = os.getenv("TICKERS", "AAPL,AMZN,GOOGL,MSFT,TSLA").split(",")
     DATA_DIR = os.getenv("DATA_DIR", "./data")
-    # --- FIXED: Refresh interval set to 300 seconds (5 minutes) for stability ---
-    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 300))  # seconds between cycles
-    # Back to 30 days for historical data
+    # --- Live loop runs every 5 minutes (300s) for the strict single-call requirement ---
+    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 300)) 
+    
+    CONTEXT_TICKERS = ["SPY", "QQQ", "^VIX"] 
+    ALL_FETCH_TICKERS = list(set(TICKERS) | set(CONTEXT_TICKERS))
+    
+    # Batch size is for the *historical* fetch in run_all.py
+    TICKER_BATCH_SIZE = int(os.getenv("TICKER_BATCH_SIZE", 8)) 
+
     CSV_RETENTION_DAYS = int(os.getenv("CSV_RETENTION_DAYS", 30))
-    LIVE_MEMORY_MINUTES = int(os.getenv("LIVE_MEMORY_MINUTES", 1440)) # 1 full day
-    ALERT_GAP_THRESHOLD = float(os.getenv("ALERT_GAP_THRESHOLD", 0.02))
     OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "phi3:mini")
     OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    NEWS_API_KEY = os.getenv("NEWS_API_KEY", "YOUR_NEWS_API_KEY") 
+    NEWS_API_URL = "https://newsapi.org/v2/everything" 
+    NEWS_REFRESH_INTERVAL = int(os.getenv("NEWS_REFRESH_INTERVAL", 600))
+    
+    # --- Rate Limit Defense ---
+    EMERGENCY_COOLDOWN = int(os.getenv("EMERGENCY_COOLDOWN", 1800)) # 1800 seconds = 30 minutes
+    
+    # --- Proxy Configuration (Removed for single-call safety) ---
+    PROXIES = [] # List is empty to enforce fetching from local IP only
+
 
 cfg = Config()
-Path(cfg.DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+# --- *** FIX 1: Imports moved here to prevent circular dependency *** ---
+import signals.technical as technical
+import signals.volume as volume
+import signals.market_context as market_context
+import signals.calendar as calendar
+import signals.sentiment as sentiment 
+# --- END FIX ---
+
+# --- POTENTIAL BUG FIX: Use the configured DATA_DIR ---
+DATA_DIR_PATH = Path(cfg.DATA_DIR)
+# --- END FIX ---
+DATA_DIR_PATH.mkdir(parents=True, exist_ok=True)
+# --- NEW: Define the alerts output file ---
+ALERTS_JSON_FILE = DATA_DIR_PATH / "live_alerts.json"
+
+# --- FIX: Moved RTH definitions here to be globally available BEFORE instantiation ---
+RTH_START = '14:30'
+RTH_END = '21:00'
+# --- END FIX ---
 
 # -----------------------
-# Logging & shutdown
+# Logging & shutdown 
 # -----------------------
 logging.basicConfig(
     level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO),
@@ -52,6 +91,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("phase2_pipeline")
 STOP_EVENT = threading.Event()
+# --- NEW GLOBAL: Track next wait time for adaptive cooldown ---
+NEXT_WAIT_TIME = cfg.REFRESH_INTERVAL
 
 def _shutdown(signum, frame):
     logger.info("Shutdown signal received, stopping pipeline...")
@@ -61,98 +102,67 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 # -----------------------
-# Ollama LLM interface (synchronous for Dash)
+# Ollama LLM interface (Omitted for brevity)
 # -----------------------
 class LLMInterface:
     def __init__(self, model_name: str = cfg.OLLAMA_MODEL_NAME, url: str = cfg.OLLAMA_API_URL):
         self.model_name = model_name
         self.url = url
-
     def generate(self, prompt: str, timeout: int = 120) -> str:
-        """
-        Synchronous call; returns final text (or error string).
-        Compatible with Dash callback usage.
-        """
         try:
-            payload = {
-                "model": self.model_name,
-                "prompt": prompt,
-                "stream": False # Crucial for synchronous call
-            }
+            payload = { "model": self.model_name, "prompt": prompt, "stream": False }
             resp = requests.post(self.url, json=payload, timeout=timeout) 
-            
-            if resp.status_code != 200:
-                error_text = resp.text.strip()
-                logger.error(f"Ollama HTTP Error {resp.status_code}: {error_text}") 
-                return f"[Ollama Error {resp.status_code}] {error_text}"
-
-            try:
-                data = resp.json()
-            except Exception as e:
-                logger.error(f"Ollama JSON Parsing Error: {e}. Raw response: {resp.text[:100]}...")
-                return resp.text or "[Ollama returned non-json response]"
-
+            resp.raise_for_status()
+            data = resp.json()
             for key in ("response", "completion", "output", "text"):
                 if key in data:
                     return str(data.get(key) or "").strip()
-            
             return json.dumps(data)
         except Exception as e:
+            logger.error(f"Ollama Error: {e}")
             return f"[Ollama Exception] {e}"
-
 llm = LLMInterface()
 
+
 # -----------------------
-# Column flattening & canonicalization
+# Column flattening & canonicalization (Unchanged)
 # -----------------------
 def flatten_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # flatten MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
-        # Handle MultiIndex DataFrame from bulk fetch (e.g., Close, Open for AAPL, MSFT)
-        # We only flatten here if it's the expected structure (like for live data split later)
-        # For historical data, this flattening might be necessary to fix old file structures
+        all_tickers = cfg.ALL_FETCH_TICKERS
         new_cols = []
         for col_level1, col_level2 in df.columns:
-            # If the index is (Attribute, Ticker), we want 'Attribute_Ticker'
-            if col_level2.upper() in cfg.TICKERS:
+            # Handle cases where level 2 is the ticker
+            if col_level2 and col_level2.upper() in all_tickers:
                 new_cols.append(f"{col_level1}_{col_level2}")
-            # If the index is (Attribute, ''), we just want 'Attribute' (for single ticker fetch)
+            # Handle cases where level 1 is the ticker (from group_by='ticker')
+            elif col_level1 and col_level1.upper() in all_tickers:
+                 new_cols.append(f"{col_level2}_{col_level1}")
             elif not col_level2:
                 new_cols.append(col_level1)
             else:
                 new_cols.append(f"{col_level1}_{col_level2}")
+        
+        # This logic is for the standard yf.download format (cols = [('Open', 'AAPL'), ('Close', 'AAPL')])
+        if not new_cols and df.columns.nlevels == 2:
+             # Standard format
+             new_cols = [f"{L1}_{L2}" for L1, L2 in df.columns]
 
         df.columns = new_cols
     
-    # Clean up stringified tuple columns like "('Close','AAPL')" - this is a legacy fix
-    # We leave this in case old CSVs have this format, but the bulk fetch fixes this.
-    new_cols = []
-    for c in df.columns:
-        if isinstance(c, str) and c.startswith("(") and "," in c and c.endswith(")"):
-            parts = [p.strip().strip("'\" ") for p in c.strip("()").split(",")]
-            if len(parts) >= 2:
-                new_cols.append(f"{parts[0]}_{parts[1]}")
-                continue
-        new_cols.append(c)
-    df.columns = new_cols
-
-    # remove exact duplicate column names
     df = df.loc[:, ~df.columns.duplicated()]
 
     try:
         df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
     except Exception:
         df.index = pd.to_datetime(df.index, errors='coerce')
-        try:
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-        except Exception:
-            pass
+        if df.index.tz is None:
+            try: df.index = df.index.tz_localize('UTC')
+            except Exception: pass
 
-    # Ensure canonical columns exist for single ticker access
     base_cols = ["Open", "High", "Low", "Close", "Volume"]
     for base in base_cols:
         suff = f"{base}_{ticker}"
@@ -169,265 +179,434 @@ def flatten_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return df
 
 # -----------------------
-# CSV loader helper
+# CSV loader/saver helpers (Unchanged)
 # -----------------------
-def load_csv(path: str, ticker: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+def load_csv(ticker: str, file_suffix: str) -> pd.DataFrame:
+    """Generic CSV loader."""
+    path = DATA_DIR_PATH / f"{ticker}{file_suffix}"
+    if not path.exists():
         return pd.DataFrame()
     try:
         df = pd.read_csv(path, index_col=0)
-    except Exception:
-        try:
-            df = pd.read_csv(path, index_col=0, header=[0,1])
-        except Exception as e:
-            logger.warning(f"Failed to read CSV {path}: {e}")
-            return pd.DataFrame()
-
-    df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
-    df = flatten_columns(df, ticker)
-    return df
-
-# -----------------------
-# Data manager (Handles HISTORICAL 30-day data)
-# -----------------------
-class DataManager:
-    def __init__(self, tickers, data_dir):
-        self.tickers = list(tickers)
-        self.data_dir = Path(data_dir)
-        self.historical = {}  # ticker -> DataFrame
-
-    def path_for_hist(self, ticker: str) -> Path:
-        return self.data_dir / f"{ticker}_hist.csv"
-
-    def load_or_fetch_hist(self, ticker: str) -> pd.DataFrame:
-        p = self.path_for_hist(ticker)
-        if p.exists():
-            df = load_csv(str(p), ticker)
-            self.historical[ticker] = df
-            logger.info(f"Loaded {ticker} HISTORICAL: {len(df)} rows")
-            return df
-        # Note: If called, it will run the single-ticker fetch below, which is slow/risky
-        return self.fetch_historical(ticker)
-
-    def fetch_historical(self, ticker: str, start=None, end=None) -> pd.DataFrame:
-        # This function is retained but is what we recommend avoiding for multiple tickers.
-        end = end or datetime.now(timezone.utc)
-        start = start or (end - timedelta(days=cfg.CSV_RETENTION_DAYS))
-        logger.info(f"Fetching 30-MINUTE historical for {ticker} from {start.date()} to {end.date()}")
-        # Fetch 30-day, 30-minute data
-        df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
-                         interval="30m", progress=False)
-        
-        if df is None or df.empty:
-            logger.warning(f"No historical data for {ticker}")
-            return pd.DataFrame()
-            
-        df.index.name = "Datetime"
+        df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
+        df.index = df.index.tz_convert('UTC')
         df = flatten_columns(df, ticker)
-        try:
-            df.to_csv(self.path_for_hist(ticker))
-            logger.info(f"Saved {ticker} HISTORICAL CSV ({len(df)} rows)")
-        except Exception as e:
-            logger.warning(f"Failed to save CSV for {ticker}: {e}")
-        self.historical[ticker] = df
         return df
+    except Exception as e:
+        logger.warning(f"Failed to read CSV {path}: {e}")
+        return pd.DataFrame()
 
-data_mgr = DataManager(cfg.TICKERS, cfg.DATA_DIR)
+# --- THIS IS THE UPDATED ATOMIC FUNCTION (Unchanged) ---
+def save_csv(df: pd.DataFrame, ticker: str, file_suffix: str):
+    """Saves a CSV file with suffixed columns ATOMICALLY."""
+    path = DATA_DIR_PATH / f"{ticker}{file_suffix}"
+    path_tmp = DATA_DIR_PATH / f"{ticker}{file_suffix}.tmp"
+    
+    df_to_save = df.copy()
+    
+    base_cols = ["Open", "High", "Low", "Close", "Volume"]
+    
+    for col in base_cols:
+        if col not in df_to_save.columns:
+            if col == 'Volume':
+                df_to_save['Volume'] = 0 
+            elif 'Close' in df_to_save.columns: 
+                df_to_save[col] = df_to_save['Close'] 
+            else:
+                continue 
+
+    for col in base_cols:
+        if col in df_to_save.columns and f"{col}_{ticker}" not in df_to_save.columns:
+            df_to_save[f"{col}_{ticker}"] = df_to_save[col]
+            if col in df_to_save.columns:
+                del df_to_save[col]
+    try:
+        df_to_save.to_csv(path_tmp) 
+        os.replace(path_tmp, path)
+        logger.info(f"Saved {file_suffix} CSV for {ticker} ({len(df_to_save)} rows total)")
+    except Exception as e:
+        logger.warning(f"Failed to save {file_suffix} CSV for {ticker}: {e}")
+        if path_tmp.exists():
+            try:
+                os.remove(path_tmp)
+            except Exception as e_clean:
+                logger.error(f"Failed to clean up {path_tmp}: {e_clean}")
 
 # -----------------------
-# LiveTracker (Handles LIVE 1-day/1-min data) - MODIFIED FOR BULK FETCH
+# LiveTracker (MODIFIED for Single API Call)
 # -----------------------
 class LiveTracker:
     def __init__(self, tickers):
-        self.tickers = list(tickers)
-        self._buffers = {t: pd.DataFrame() for t in self.tickers}
+        self.all_tickers = cfg.ALL_FETCH_TICKERS 
+        self._hist_buffers = {t: pd.DataFrame() for t in self.all_tickers}
+        self._live_buffers = {t: pd.DataFrame() for t in self.all_tickers}
         self.lock = threading.Lock()
-
-    def update_all(self):
-        """
-        Fetch all 1-minute data for ALL tickers in a single bulk API call.
-        """
-        logger.info("Starting BULK live data fetch for all tickers.")
-        try:
-            # --- CRITICAL FIX: Single bulk call for all tickers ---
-            # Fetch 1-day, 1-minute data for all tickers
-            df_bulk = yf.download(self.tickers, period="1d", interval="1m", progress=False)
-            
-            if df_bulk is None or df_bulk.empty:
-                logger.debug("No BULK LIVE data (market may be closed or rate limit error)")
-                return
-            
-            # Ensure the index is a datetime index
-            df_bulk.index = pd.to_datetime(df_bulk.index, utc=True, errors='coerce')
-            
-            with self.lock:
-                for t in self.tickers:
-                    # 1. Slice the MultiIndex DataFrame for the specific ticker
-                    # The MultiIndex is structured as (Attribute, Ticker)
-                    # Use df_bulk.columns.get_level_values(1) to check which tickers are present
-                    
-                    if t in df_bulk.columns.get_level_values(1):
-                        # Extract all attributes (Open, High, Low, etc.) for the current ticker (t)
-                        df_ticker = df_bulk.xs(t, level=1, axis=1)
-                        
-                        # 2. Rename columns to canonical format (e.g., 'Close' not 'Close_AAPL') for the buffer
-                        df_ticker.columns.name = None # Remove the name of the column level
-                        df_ticker.columns = [c.capitalize() for c in df_ticker.columns]
-                        
-                        # 3. Store the cleaned single-ticker DataFrame in the buffer
-                        self._buffers[t] = df_ticker
-                        logger.debug(f"Successfully updated live buffer for {t} ({len(df_ticker)} rows).")
-                    else:
-                        logger.warning(f"Ticker {t} not found in the bulk download result.")
-                        
-        except Exception as e:
-            # This will catch a single YFRateLimitError for the entire batch, which is much cleaner
-            logger.error(f"Bulk live update failed: {e}")
-
-    def get_buffer(self, ticker: str) -> pd.DataFrame:
-        with self.lock:
-            buf = self._buffers.get(ticker)
-            # Need to re-flatten the columns on output to satisfy the AlertEngine/Flatten func 
-            # and ensure it has the expected 'Close_TICKER' format if needed.
-            df_copy = buf.copy() if buf is not None else pd.DataFrame()
-            return flatten_columns(df_copy, ticker)
-
-
-    def save_buffer(self, ticker: str, data_dir: Path):
-        """Saves the current live buffer to a _live.csv file."""
-        p = Path(data_dir) / f"{ticker}_live.csv"
-        buf = self.get_buffer(ticker)
         
-        # Ensure we are saving the canonical format with Ticker suffix for easy reading later
-        df_to_save = buf.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in df_to_save.columns:
-                df_to_save[f"{col}_{ticker}"] = df_to_save[col]
-                del df_to_save[col]
+        self.load_all_buffers()
 
-        if not df_to_save.empty:
-            try:
-                df_to_save.to_csv(p)
-                logger.info(f"Saved LIVE CSV for {ticker}")
-            except Exception as e:
-                logger.warning(f"Failed to save LIVE CSV for {ticker}: {e}")
+    def load_all_buffers(self):
+        """Loads all _hist and _live files into memory on startup."""
+        logger.info("Loading existing data into memory buffers...")
+        with self.lock:
+            for t in self.all_tickers:
+                self._hist_buffers[t] = load_csv(t, "_hist.csv")
+                self._live_buffers[t] = load_csv(t, "_live.csv")
 
-live_tracker = LiveTracker(cfg.TICKERS)
+    def get_last_timestamp(self, ticker: str, file_suffix: str) -> datetime | None:
+        """Finds the last timestamp for a ticker in the specified buffer."""
+        buffer = self._hist_buffers if file_suffix == "_hist.csv" else self._live_buffers
+        with self.lock:
+            df = buffer.get(ticker)
+            if df is not None and not df.empty:
+                return df.index.max()
+        return None
+        
+    def get_hist_buffer(self, ticker: str) -> pd.DataFrame:
+        with self.lock:
+            buf = self._hist_buffers.get(ticker)
+            return buf.copy() if buf is not None else pd.DataFrame()
 
+    def get_live_buffer(self, ticker: str) -> pd.DataFrame:
+        with self.lock:
+            buf = self._live_buffers.get(ticker)
+            return buf.copy() if buf is not None else pd.DataFrame()
+
+    # --- UPDATED FUNCTION FOR SINGLE API CALL ---
+    def update_live_buffers(self):
+        """
+        Fetches 1 day of 5-MINUTE data for ALL tickers using a single API call,
+        reducing high volume risk and strictly limiting request frequency.
+        """
+        logger.info(f"Starting SINGLE API CALL live fetch for ALL {len(self.all_tickers)} tickers...")
+        
+        # NEW: Perform ONE bulk download for ALL tickers
+        try:
+            # FIX: Using period="1d" for correct yfinance syntax and relying on 5-min cooldown
+            df_bulk = yf.download(self.all_tickers, period="1d", interval="5m", progress=False, group_by='ticker')
+        except requests.exceptions.RequestException as e:
+            logger.error(f"FATAL API RATE LIMIT FAILURE during single live fetch: {e}")
+            raise # Crash the cycle to trigger the adaptive cooldown
+        except Exception as e:
+            logger.error(f"General error during single live fetch: {e}")
+            raise # Crash the cycle
+
+        if df_bulk is None or df_bulk.empty:
+            logger.warning("No live data returned (market may be closed or data volume too low).")
+            return
+
+        df_bulk.index = pd.to_datetime(df_bulk.index, utc=True, errors='coerce')
+        
+        with self.lock:
+            for t in self.all_tickers:
+                df_ticker = pd.DataFrame()
+                
+                # Check if we got a MultiIndex (standard for >1 tickers)
+                if isinstance(df_bulk.columns, pd.MultiIndex):
+                    if t in df_bulk.columns:
+                        df_ticker = df_bulk[t].copy()
+                    else:
+                        logger.warning(f"Ticker {t} not found in bulk download result.")
+                        continue
+                # If we got a simple DataFrame (e.g., if ALL_FETCH_TICKERS only had one item)
+                elif len(self.all_tickers) == 1:
+                    df_ticker = df_bulk.copy()
+                else:
+                     logger.warning(f"Unexpected DataFrame structure for {t} after bulk fetch.")
+                     continue
+                
+                # Clean and save the individual ticker data
+                df_ticker.columns.name = None
+                df_ticker.columns = [c.capitalize() for c in df_ticker.columns]
+                
+                if not df_ticker.empty:
+                    self._live_buffers[t] = df_ticker 
+                    logger.debug(f"Updated live (5-min) buffer for {t} ({len(df_ticker)} rows).")
+                    
+                    if t in cfg.TICKERS:
+                        save_csv(df_ticker, t, "_live.csv")
+
+        logger.info("Completed single-call live fetch.")
+
+    # ... (update_historical_buffers is unchanged) ...
+    def update_historical_buffers(self):
+        """
+        Runs the "Smart Incremental Backfill" for all 30-min _hist.csv files.
+        """
+        logger.info("Starting Smart Historical Backfill (30-min data)...")
+        end_date = datetime.now(timezone.utc)
+        
+        for ticker in self.all_tickers:
+            if STOP_EVENT.is_set(): return
+            
+            df_hist = self.get_hist_buffer(ticker)
+            start_date = None
+            
+            if df_hist.empty:
+                start_date = end_date - timedelta(days=cfg.CSV_RETENTION_DAYS)
+                logger.info(f"No 30-min data for {ticker}. Fetching full {cfg.CSV_RETENTION_DAYS}-day history.")
+            else:
+                last_ts = df_hist.index.max()
+                # Check if the last data is older than 30-mins ago
+                if last_ts < end_date - timedelta(minutes=30):
+                    start_date = last_ts + timedelta(minutes=30)
+                    logger.info(f"Fetching new 30-min data for {ticker} since {start_date}...")
+                else:
+                    logger.info(f"30-min data for {ticker} is up-to-date. Skipping.")
+            
+            if start_date:
+                try:
+                    # --- THIS IS THE STABLE 30-MINUTE CALL ---
+                    df_chunk = yf.download(
+                        ticker, 
+                        start=start_date.strftime("%Y-%m-%d"), 
+                        end=end_date.strftime("%Y-%m-%d"),
+                        interval="30m", 
+                        progress=False
+                    )
+                    
+                    if not df_chunk.empty:
+                        df_chunk.index.name = "Datetime"
+                        df_chunk = flatten_columns(df_chunk, ticker)
+                        
+                        with self.lock:
+                            # --- APPEND the new 30-min chunk ---
+                            df_combined = pd.concat([df_hist, df_chunk])
+                            df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+                            df_combined = df_combined.sort_index()
+                            
+                            # Prune data older than 30 days
+                            cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.CSV_RETENTION_DAYS)
+                            df_combined = df_combined[df_combined.index >= cutoff]
+                            
+                            self._hist_buffers[ticker] = df_combined
+                            logger.info(f"Appended {len(df_chunk)} new 30-min rows for {ticker}.")
+                            save_csv(df_combined, ticker, "_hist.csv")
+                    else:
+                        logger.info(f"No new 30-min data found for {ticker}.")
+                        
+                    if not STOP_EVENT.is_set():
+                        time.sleep(5) # 5-second safety delay between each *historical* fetch
+
+                except Exception as e:
+                    logger.error(f"Failed to backfill 30-min data for {ticker}: {e}")
+                    
 # -----------------------
-# Simple AlertEngine (relies on canonical "Close" and "Volume")
+# Modular Alert Engine (Unchanged)
 # -----------------------
 class AlertEngine:
-    def __init__(self, cfg):
+    def __init__(self, cfg, live_tracker):
         self.cfg = cfg
+        self.live_tracker = live_tracker
 
-    def _series(self, df: pd.DataFrame, ticker: str, name: str) -> pd.Series:
-        if df is None or df.empty:
-            return pd.Series(dtype=float)
-        # Check for both canonical 'Close' and suffixed 'Close_TICKER'
-        for col_name in [name, f"{name}_{ticker}"]:
-            if col_name in df.columns:
-                s = df[col_name]
-                return pd.to_numeric(s, errors='coerce').dropna()
-                
-        return pd.Series(dtype=float)
-
-    def evaluate(self, ticker: str, df: pd.DataFrame):
-        df = flatten_columns(df, ticker)
-        alerts = []
-        close = self._series(df, ticker, "Close")
-        vol = self._series(df, ticker, "Volume")
+    def evaluate_live_alerts(self, ticker: str) -> tuple[list[str], dict]:
+        # --- Get 5-MINUTE data for live alerts ---
+        df = self.live_tracker.get_live_buffer(ticker)
+        if df.empty or len(df) < 21:
+            return [], {} 
         
-        # trend (good for 30-min or 1-min data)
-        if len(close) >= 20:
-            ma5 = close.rolling(5, min_periods=5).mean().iloc[-1]
-            ma20 = close.rolling(20, min_periods=20).mean().iloc[-1]
-            if ma5 > ma20:
-                # *** NEW FRIENDLY NAME ***
-                alerts.append("Price Trending Up Recently")
-            else:
-                # *** NEW FRIENDLY NAME ***
-                alerts.append("Price Trending Down Recently")
-                
-        # volatility (good for 1-min data)
-        if len(close) >= 2:
-            pct = abs(close.iloc[-1] / close.iloc[-2] - 1)
-            if pct > self.cfg.ALERT_GAP_THRESHOLD:
-                # *** NEW FRIENDLY NAME ***
-                alerts.append("Sudden Price Swing")
-                
-        # volume spike (good for 1-min data)
-        if len(vol) >= 10:
-            latest = float(vol.iloc[-1])
-            # Use a 10-period avg for 1-min data
-            avg = float(vol.rolling(10).mean().iloc[-1])
-            if avg > 0 and latest > avg * 2.0: # 2x spike
-                # *** NEW FRIENDLY NAME ***
-                alerts.append("Unusual Trading Activity")
-        return alerts
+        df_rth = df.between_time(RTH_START, RTH_END)
+        if df_rth.empty or len(df_rth) < 21:
+            logger.debug(f"Not enough RTH 5-min data for {ticker} to run alerts.")
+            return [], {} 
 
-alert_engine = AlertEngine(cfg)
-
-# -----------------------
-# Pipeline orchestration
-# -----------------------
-def initial_setup():
-    """Load or fetch historical 30-day data for all tickers."""
-    # This is still here in case you want to uncomment and run it separately.
-    HISTORICAL_FETCH_DELAY = 60 # seconds 
-    for t in cfg.TICKERS:
+        all_alerts = []
+        all_indicators = {}
+        
         try:
-            data_mgr.load_or_fetch_hist(t)
-            if not STOP_EVENT.is_set():
-                logger.info(f"Pausing for {HISTORICAL_FETCH_DELAY}s before fetching next historical data.")
-                time.sleep(HISTORICAL_FETCH_DELAY) # Added/Increased delay
+            alerts, indicators = technical.compute_signals(df_rth, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+            
+            alerts, indicators = volume.compute_signals(df_rth, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+            
+            alerts, indicators = calendar.compute_signals(df_rth, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+
+            alerts, indicators = market_context.compute_signals(df_rth, ticker, self.live_tracker, "get_live_buffer")
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+
+            alerts, indicators = sentiment.compute_signals(ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+            
         except Exception as e:
-            logger.warning(f"Initial HISTORICAL load failed for {t}: {e}")
-
-def process_cycle():
-    """Single pipeline cycle: update live 1-min buffers, save to _live.csv"""
-    
-    # 1. Fetch 1-day/1-min data using a single bulk call
-    live_tracker.update_all()
-    
-    for t in cfg.TICKERS:
-        # 2. Save the live data from memory to `_live.csv`
-        # This step is still done individually because we need to save one file per ticker
-        live_tracker.save_buffer(t, cfg.DATA_DIR)
+            logger.error(f"Error computing signals for {ticker} (live): {e}")
+            
+        return all_alerts, all_indicators
         
-        # 3. (Optional) Run alerts on the live data
-        live_df = live_tracker.get_buffer(t)
-        if not live_df.empty:
-            alerts = alert_engine.evaluate(t, live_df)
-            if alerts:
-                logger.info(f"{t} Live Alerts: {alerts}")
-        else:
-            logger.debug(f"No live data for {t}, skipping alerts.")
+    def evaluate_historical_alerts(self, ticker: str) -> tuple[list[str], dict]:
+        # --- Get 30-MINUTE data for historical alerts ---
+        df = self.live_tracker.get_hist_buffer(ticker)
+        if df.empty or len(df) < 21:
+            return [], {} 
+        
+        all_alerts = []
+        all_indicators = {}
 
-def run_forever():
-    # 1. Get 30-day/30-min data *once*
-    # --- FINAL FIX: COMMENTING OUT initial_setup to bypass perpetual rate limit failures ---
-    # initial_setup() 
+        try:
+            alerts, indicators = technical.compute_signals(df, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+
+            alerts, indicators = volume.compute_signals(df, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+
+            alerts, indicators = calendar.compute_signals(df, ticker)
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+            
+            alerts, indicators = market_context.compute_signals(df, ticker, self.live_tracker, "get_hist_buffer") 
+            all_alerts.extend(alerts)
+            all_indicators.update(indicators)
+            
+        except Exception as e:
+            logger.error(f"Error computing signals for {ticker} (historical): {e}")
+
+        return all_alerts, all_indicators
+
+# --- Instances must be created after class definitions ---
+live_tracker = LiveTracker(cfg.TICKERS)
+alert_engine = AlertEngine(cfg, live_tracker) 
+
+# -----------------------
+# MODIFIED: News/Sentiment Fetcher (Unchanged)
+# -----------------------
+def news_fetcher_task():
+    """ Runs news fetch serially. """
+    logger.info(f"Sentiment: Starting news/sentiment fetch...")
+    try:
+        sentiment.fetch_news_and_analyze(cfg.TICKERS, cfg.NEWS_API_URL, cfg.NEWS_API_KEY)
+    except Exception as e:
+        logger.error(f"Error in news_fetcher_task: {e}")
+    logger.info("Sentiment: News fetch complete.")
+
+# -----------------------
+# Pipeline orchestration (MODIFIED for Adaptive Cooldown)
+# -----------------------
+def process_cycle(run_count: int):
+    """
+    Single pipeline cycle (every N seconds):
+    1. Fetches news.
+    2. Fetches 1-day/5-min data (triggers adaptive cooldown on failure).
+    3. Runs alerts on the new data AND SAVES THEM.
+    """
+    global NEXT_WAIT_TIME
     
-    # FIX 2 (FINAL): Increased cooldown to 300 seconds (5 minutes)
-    COOLDOWN_SECONDS = 300 
-    logger.info(f"Skipping historical setup. Waiting {COOLDOWN_SECONDS}s before starting live loop...")
-    for _ in range(COOLDOWN_SECONDS):
+    logger.info(f"Starting new cycle (Run #{run_count})... Next wait: {NEXT_WAIT_TIME}s")
+    
+    # 1. Run news fetch (Low risk, run first)
+    news_fetcher_task()
+    
+    live_fetch_succeeded = True
+    
+    # 2. Fetch 5-min live data (High risk, must handle exceptions to trigger stall)
+    try:
+        live_tracker.update_live_buffers()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"FATAL API RATE LIMIT FAILURE during single live fetch. Aborting cycle: {e}")
+        live_fetch_succeeded = False 
+    except Exception as e:
+        logger.error(f"Unexpected error during single live fetch. Aborting cycle: {e}")
+        live_fetch_succeeded = False 
+
+    # 3. Check for Failure and ADJUST THE NEXT WAIT TIME
+    if not live_fetch_succeeded:
+        # If API failed, increase the cooldown for the next cycle
+        if NEXT_WAIT_TIME != cfg.EMERGENCY_COOLDOWN:
+            logger.critical(f"RATE LIMIT DETECTED. Setting NEXT_WAIT_TIME to EMERGENCY_COOLDOWN ({cfg.EMERGENCY_COOLDOWN}s).")
+            NEXT_WAIT_TIME = cfg.EMERGENCY_COOLDOWN
+            # We skip the rest of the cycle since data is stale/missing
+            return 
+    else:
+        # If successful, reset back to the normal 5-minute interval
+        if NEXT_WAIT_TIME != cfg.REFRESH_INTERVAL:
+            logger.info("Live fetch SUCCESS. Resetting NEXT_WAIT_TIME to normal interval (5 min).")
+            NEXT_WAIT_TIME = cfg.REFRESH_INTERVAL
+
+    # 4. Run remaining operations (Historical Backfill and Alerts)
+    
+    # Fetch 30-min historical data (every 3rd run, i.e., ~15 mins now)
+    if run_count % 3 == 0:
+        live_tracker.update_historical_buffers()
+    else:
+        logger.info("Skipping 30-min historical backfill this cycle.")
+    
+    # Run alerts and SAVE them to JSON
+    all_alerts = {}
+    for t in cfg.TICKERS:
         if STOP_EVENT.is_set():
             break
-        time.sleep(1)
-    
-    # --- LOG UPDATED TO REFLECT 5 MINUTE CYCLE ---
-    logger.info("Starting Phase 2 pipeline loop (updating 5-min interval)...")
-    while not STOP_EVENT.is_set():
+            
+        live_alerts, live_indicators = alert_engine.evaluate_live_alerts(t)
+        hist_alerts, hist_indicators = alert_engine.evaluate_historical_alerts(t)
+        
+        all_alerts[t] = {
+            "live": live_alerts,
+            "live_indicators": live_indicators,
+            "historical": hist_alerts,
+            "historical_indicators": hist_indicators
+        }
+        
+        if live_alerts:
+            logger.info(f"{t} Modular Live (5-Min) Alerts: {live_alerts}")
+
+    # Atomic write for the alerts file
+    if not STOP_EVENT.is_set() and all_alerts:
         try:
-            # 2. Every 5 minutes, get 1-day/1-min data
-            process_cycle()
+            ALERTS_JSON_FILE_TMP = DATA_DIR_PATH / "live_alerts.json.tmp"
+            with open(ALERTS_JSON_FILE_TMP, 'w', encoding='utf-8') as f:
+                json.dump(all_alerts, f, indent=2)
+            os.replace(ALERTS_JSON_FILE_TMP, ALERTS_JSON_FILE)
+            logger.info(f"Successfully saved alerts for {len(all_alerts)} tickers to {ALERTS_JSON_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to save alerts JSON file: {e}")
+    
+    logger.info(f"Completed cycle. Next run in {NEXT_WAIT_TIME}s.")
+
+
+def run_forever():
+    
+    logger.info("Running initial data backfill on startup...")
+    try:
+        # 1. Run low-risk actions first
+        news_fetcher_task()
+        live_tracker.update_historical_buffers()
+        
+        # --- CRITICAL FIX: The immediate live_tracker.update_live_buffers() is REMOVED ---
+        # The first live fetch MUST occur inside the main loop after the initial wait period.
+
+    except Exception as e:
+        logger.exception(f"Error in initial data fetch: {e}")
+
+    logger.info(f"Starting Phase 2 pipeline loop (updating {cfg.REFRESH_INTERVAL // 60}-min interval)...")
+    run_count = 1
+    
+    while not STOP_EVENT.is_set():
+        cycle_start_time = time.time()
+        
+        # 1. PROCESS
+        try:
+            # We removed the immediate live fetch from startup, so the first process_cycle
+            # will handle the first live fetch after the run_all.py cooldown.
+            process_cycle(run_count)
         except Exception as e:
             logger.exception(f"Error in process cycle: {e}")
         
-        # Wait for the full 5-minute refresh interval
-        for _ in range(max(1, int(cfg.REFRESH_INTERVAL))):
+        run_count += 1
+        
+        # 2. WAIT
+        if STOP_EVENT.is_set():
+            break
+            
+        wait_time = NEXT_WAIT_TIME
+        
+        logger.info(f"Waiting for {wait_time}s until next live (5-min) fetch...")
+        for _ in range(wait_time):
             if STOP_EVENT.is_set():
                 break
             time.sleep(1)
