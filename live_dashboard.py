@@ -346,7 +346,7 @@ def update_cards_and_global_stores(n):
         # --- FIX: Use DST-aware RTH filter for live cards ---
         if not df_live.empty:
             df_live_local_tz = df_live.index.tz_convert(EASTERN_TZ)
-            df_rth = df_live.loc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
+            df_rth = df_live.iloc[df_live_local_tz.indexer_between_time('09:30', '16:00')]
         else:
             df_rth = pd.DataFrame()
         # --- END FIX ---
