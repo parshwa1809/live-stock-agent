@@ -15,14 +15,12 @@ import threading
 
 # --- Configuration ---
 load_dotenv()
-# --- FIX: Import config directly from the pipeline ---
 from phase2_pipeline import cfg 
 
 DATA_DIR = Path(cfg.DATA_DIR)
 TICKERS = cfg.TICKERS
 CONTEXT_TICKERS = cfg.CONTEXT_TICKERS
 ALL_RAG_TICKERS = cfg.ALL_FETCH_TICKERS 
-# --- END FIX ---
 
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 
@@ -50,43 +48,27 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 # ------------------------------------
 
-def load_data(ticker: str, file_suffix: str) -> pd.DataFrame:
+def load_data(ticker: str) -> pd.DataFrame:
     """
-    Loads and validates a single CSV file, restoring all base columns
-    from their suffixed versions (e.g., Open_AAPL -> Open).
+    Loads the single unified <TICKER>.csv file containing 5-minute data.
     """
-    path = DATA_DIR / f"{ticker}{file_suffix}"
+    # CRITICAL FIX: Load the unified file
+    path = DATA_DIR / f"{ticker}.csv"
     if not path.exists():
-        # --- Handle VIX historical file fallback ---
-        if ticker == "^VIX" and file_suffix == "_hist.csv":
-            path_fallback = DATA_DIR / "^VIX_hist.csv" 
-            if path_fallback.exists():
-                logger.warning("RAG: Found old '^VIX_hist.csv'. Using it.")
-                path = path_fallback 
-            else:
-                logger.warning(f"RAG: {ticker}{file_suffix} not found, skipping.")
-                return pd.DataFrame()
-        else:
-             logger.warning(f"RAG: {ticker}{file_suffix} not found, skipping.")
-             return pd.DataFrame()
+        logger.warning(f"RAG: Unified data file {ticker}.csv not found, skipping.")
+        return pd.DataFrame()
              
     try:
         df = pd.read_csv(path, index_col=0)
         df.index = pd.to_datetime(df.index, utc=True).tz_convert('UTC')
         
-        # --- FIX: Loop through ALL base columns to restore them from suffixed versions ---
+        # Restore all base columns from suffixed versions (e.g., Open_AAPL -> Open)
         base_cols = ["Open", "High", "Low", "Close", "Volume"]
         for col in base_cols:
             suffixed_col = f"{col}_{ticker}"
-            # If the simple column "Open" doesn't exist, but "Open_AAPL" does, copy it over
             if col not in df.columns and suffixed_col in df.columns:
                 df[col] = pd.to_numeric(df[suffixed_col], errors='coerce')
         
-        # Final check to ensure we have what we need
-        if 'Close' not in df.columns:
-             logger.debug(f"RAG: Close price column missing for {ticker}.")
-             return pd.DataFrame() 
-
         # Drop any rows where 'Close' may have been coerced to NaN
         df = df.dropna(subset=['Close']) 
              
@@ -118,6 +100,7 @@ def load_news_chunks() -> list:
             source = article.get('source', {}).get('name', 'Unknown')
             published_at = article.get('publishedAt', 'unknown time')
             
+            # Find the primary ticker this article is about
             target_ticker = next((t for t in TICKERS if t.lower() in title.lower()), None)
             
             if target_ticker:
@@ -229,33 +212,32 @@ def build_index():
     
     all_text_chunks = []
     
-    # 1. Load data for ALL RAG TICKERS (Primary Stocks + Context Tickers)
+    # 1. Load the UNIFIED 5-minute data
     for ticker in ALL_RAG_TICKERS:
-        # Load 30-MIN HISTORICAL data
-        hist_df = load_data(ticker, "_hist.csv")
-        if not hist_df.empty:
-            # Resample to Daily for high-level summary
-            hist_daily_df = hist_df.resample('D').agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna(subset=['Close']) 
-            
-            hist_chunks = analyze_and_get_chunks(hist_daily_df, ticker, "Daily (from 30-min)")
-            all_text_chunks.extend(hist_chunks)
+        df_unified = load_data(ticker)
         
-        # Load 5-MIN LIVE data
-        live_df = load_data(ticker, "_live.csv")
-        if not live_df.empty:
-            live_rth_df = live_df.between_time(RTH_START, RTH_END)
-            if not live_rth_df.empty:
-                # --- Resample 5-min data to 30-min for consistent RAG analysis ---
-                live_30min_df = live_rth_df.resample('30min').agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-                }).dropna(subset=['Close']) 
-                
-                # NOTE: The RAG chunk is correctly labeled "30-Minute (from 5-min)" for accuracy
-                live_chunks = analyze_and_get_chunks(live_30min_df, ticker, "30-Minute (from 5-min)")
-                all_text_chunks.extend(live_chunks)
+        if df_unified.empty:
+            continue
+            
+        # --- NEW: Resample 5-min data to 30-min for Historical Context Chunks ---
+        # This replaces the need for the old _hist.csv file
+        hist_30min_df = df_unified.resample('30min').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna(subset=['Close']) 
+        
+        hist_chunks = analyze_and_get_chunks(hist_30min_df, ticker, "30-Minute (Historical)")
+        all_text_chunks.extend(hist_chunks)
 
+        # --- NEW: Resample 5-min data to Daily for high-level summary chunks ---
+        hist_daily_df = df_unified.resample('D').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna(subset=['Close']) 
+        
+        daily_chunks = analyze_and_get_chunks(hist_daily_df, ticker, "Daily (Historical)")
+        all_text_chunks.extend(daily_chunks)
+
+        # NOTE: We skip RTH/Live chunks here as the 30-min and Daily chunks are sufficient context.
+        
     # 2. Load news headlines and add them to the chunks
     all_text_chunks.extend(load_news_chunks())
 

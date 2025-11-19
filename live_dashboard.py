@@ -3,25 +3,11 @@
 Unified Live Stock Dashboard — Phase 2 (FINAL STABLE VERSION)
 
 Features:
-- **STABLE 5-MIN DATA:** All "Live" charts and alerts are now driven by the
-  stable 5-minute data (`_live.csv`) fetched by the pipeline.
-- **30-MIN HISTORICAL:** "Historical" charts still use the 30-minute
-  `_hist.csv` file for long-term context.
+- **FILE STRUCTURE (NEW):** Reads the single unified <TICKER>.csv file.
+- **STATISTICS:** Dashboard seamlessly uses the single 5-minute file for both
+  historical (long-term) charts and live (intraday) charts via time filtering.
 - **ALL ALERTS & NEWS:** All alert types (Live 5-Min, Hist 30-Min, News)
   are fully functional and displayed in the UI.
-
-- **BUG FIX (v2.1):** Removed all global variables and locks (e.g., 
-  dash_live_tracker, alert_lock, alert_history lists).
-- **STATE MANAGEMENT (v2.1):** All data is now shared between callbacks 
-  using dcc.Store components (e.g., 'hist-data-store', 
-  'live-data-store', 'hist-alerts-store', 'live-alerts-store'). 
-  This makes the dashboard stateless and process-safe for production
-  servers like Gunicorn.
-- **BUG FIX (v2.2):** The RAG index now automatically reloads from disk
-  if it detects a newer version, preventing stale chat responses.
-- **OPTIMIZATION (v2.2):** Technical indicators (RSI, MACD) are no longer
-  calculated in the dashboard. They are read directly from the
-  'live_alerts.json' file produced by the pipeline, centralizing logic.
 """
 
 import os
@@ -38,28 +24,18 @@ import json
 from pathlib import Path 
 import faiss
 from sentence_transformers import SentenceTransformer
-# --- OPTIMIZATION: Removed pandas_ta import ---
-# import pandas_ta as ta 
-# --- FIX: Removed threading import ---
 
-# --- CRITICAL CHANGE: Import cfg, llm. All signal modules are REMOVED ---
 from phase2_pipeline import cfg, llm 
-# --- FIX: Removed all signal imports (technical, volume, etc.) ---
 
-# Set up the cache manager for background callbacks
 cache = diskcache.Cache("./cache", timeout=120) 
 long_callback_manager = DiskcacheManager(cache) 
 
-DATA_PATH = Path(cfg.DATA_DIR) # Use DATA_DIR from imported cfg
+DATA_PATH = Path(cfg.DATA_DIR) 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("live_dashboard")
 
-# Pass the correct argument for new Dash versions
 app = Dash(__name__, background_callback_manager=long_callback_manager) 
 server = app.server
-
-# --- FIX: All global alert/data variables and locks have been REMOVED ---
-# (e.g., hist_alert_history, live_alert_history, alert_lock, etc.)
 
 # Define Regular Trading Hours (RTH) in UTC
 RTH_START = '14:30'
@@ -74,7 +50,6 @@ EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 NEWS_JSON_FILE = DATA_PATH / "news_headlines.json"
 ALERTS_JSON_FILE = DATA_PATH / "live_alerts.json"
 
-# --- FIX: Load model globally ONCE at startup ---
 logger.info(f"Loading embedding model '{EMBEDDING_MODEL_NAME}' globally...")
 try:
     embedding_model_cache = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -82,22 +57,18 @@ try:
 except Exception as e:
     logger.error(f"FATAL: Could not load SentenceTransformer model. RAG will fail. Error: {e}")
     embedding_model_cache = None
-# --- END FIX ---
 
-# --- NEW FIX: Load RAG index and texts globally ONCE at startup ---
 logger.info("Loading RAG index and text files into memory...")
 try:
     if RAG_INDEX_FILE.exists() and RAG_TEXTS_FILE.exists():
         rag_index_cache = faiss.read_index(str(RAG_INDEX_FILE))
         with open(RAG_TEXTS_FILE, 'r', encoding='utf-8') as f:
             rag_texts_cache = json.load(f)
-        # --- BUG FIX: Add global variable to track load time ---
         rag_index_load_time = os.path.getmtime(RAG_INDEX_FILE)
         logger.info(f"Successfully loaded RAG index and {len(rag_texts_cache)} text chunks.")
     else:
         rag_index_cache = None
         rag_texts_cache = None
-        # --- BUG FIX: Initialize load time to 0 ---
         rag_index_load_time = 0.0
         logger.warning("RAG index or text file not found. Chat will have no context.")
 except Exception as e:
@@ -105,56 +76,43 @@ except Exception as e:
     rag_index_cache = None
     rag_texts_cache = None
     rag_index_load_time = 0.0
-# --- END NEW FIX ---
 
-
-# --- THIS IS THE UPDATED SELF-HEALING FUNCTION ---
 def search_rag_index(query: str, k=3) -> str:
     """
     Embeds a query, searches the FAISS index, and returns the top k text chunks.
-    --- SELF-HEALING: If the index is not in memory, or if the file on disk
-    is newer, it will (re)load it from disk on-the-fly.
+    SELF-HEALING: Reloads the index from disk if it is stale.
     """
-    global embedding_model_cache, rag_index_cache, rag_texts_cache, rag_index_load_time # <-- Added rag_index_load_time
+    global embedding_model_cache, rag_index_cache, rag_texts_cache, rag_index_load_time
     
     if embedding_model_cache is None:
         logger.error("Embedding model is not loaded. Check startup logs.")
         return "Error: Embedding model is not loaded."
         
-    # --- NEW SELF-HEALING LOGIC ---
     try:
-        # Check if files exist NOW
         if RAG_INDEX_FILE.exists() and RAG_TEXTS_FILE.exists():
             current_mtime = os.path.getmtime(RAG_INDEX_FILE)
             
-            # --- THIS IS THE KEY CHANGE ---
             if rag_index_cache is None or current_mtime > rag_index_load_time:
                 logger.warning("RAG index is stale (or not loaded). Reloading from disk...")
                 
-                # Load them into the global cache
                 rag_index_cache = faiss.read_index(str(RAG_INDEX_FILE))
                 with open(RAG_TEXTS_FILE, 'r', encoding='utf-8') as f:
                     rag_texts_cache = json.load(f)
                 
-                # Update the load time
                 rag_index_load_time = current_mtime
                 
                 logger.info(f"RAG index reloaded successfully ({len(rag_texts_cache)} chunks).")
         else:
-            # Files still don't exist, tell user to wait
             logger.warning("RAG files still not found on disk.")
             return "No data in RAG index. Please wait for pipeline to run."
             
     except Exception as e:
         logger.error(f"Failed to load RAG index from disk: {e}")
-        # Clear cache on partial failure
         rag_index_cache = None
         rag_texts_cache = None
-        rag_index_load_time = 0.0 # Reset load time
+        rag_index_load_time = 0.0 
         return f"Error loading RAG index: {e}"
-    # --- END NEW LOGIC ---
         
-    # Proceed with search (cache is now guaranteed to be loaded if files exist)
     try:
         query_vector = embedding_model_cache.encode([query]).astype('float32')
         distances, indices = rag_index_cache.search(query_vector, k)
@@ -164,24 +122,23 @@ def search_rag_index(query: str, k=3) -> str:
     except Exception as e:
         logger.error(f"Error during RAG search: {e}")
         return "Error searching RAG index."
-# --- END UPDATED FUNCTION ---
-
 
 # =====================================================
-# LOAD CSV & GET COLUMN HELPERS
+# LOAD CSV & GET COLUMN HELPERS (MODIFIED)
 # =====================================================
-def load_data(ticker: str, file_suffix: str) -> pd.DataFrame:
-    # --- This function is now stable and reads both files ---
-    path = DATA_PATH / f"{ticker}{file_suffix}"
+def load_data(ticker: str) -> pd.DataFrame:
+    """
+    Loads the single unified <TICKER>.csv file (file_suffix argument is obsolete).
+    """
+    # CRITICAL FIX: Load the unified file <TICKER>.csv
+    path = DATA_PATH / f"{ticker}.csv"
+    
     if not path.exists():
         if ticker in cfg.TICKERS:
-            logger.warning(f"{ticker}{file_suffix} not found at {path}")
+            logger.warning(f"Unified data file {ticker}.csv not found.")
         return pd.DataFrame()
     try:
-        try:
-            df = pd.read_csv(path, index_col=0)
-        except Exception:
-            df = pd.read_csv(path, index_col=0, header=[0,1])
+        df = pd.read_csv(path, index_col=0)
             
         df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
         df.index = df.index.tz_convert('UTC')
@@ -218,7 +175,6 @@ def load_news_headlines() -> list:
         logger.error(f"Dashboard: Failed to read {NEWS_JSON_FILE}: {e}")
         return []
 
-# --- NEW: Helper function to load alerts from the pipeline ---
 def load_alerts() -> dict:
     """Safely loads alerts from the JSON file."""
     if not ALERTS_JSON_FILE.exists():
@@ -237,7 +193,6 @@ def load_alerts() -> dict:
     except Exception as e:
         logger.error(f"Dashboard: Failed to read {ALERTS_JSON_FILE}: {e}")
         return {}
-# --- END NEW FUNCTION ---
 
 def get_col(df, ticker, col, fill_na=None):
     if df is None or df.empty:
@@ -257,26 +212,15 @@ def get_col(df, ticker, col, fill_na=None):
         return s.dropna()
 
 # =====================================================
-# Dashboard-Side Alert Engine (REMOVED)
-# =====================================================
-# --- FIX: Removed the entire DashboardLiveTracker class and instance ---
-
-
-# =====================================================
-# LAYOUT (Vertically Compressed and Aligned)
+# LAYOUT (Unchanged)
 # =====================================================
 app.layout = html.Div([
     dcc.Store(id='chat-history-store', storage_type='memory', data=[]),
     
-    # --- FIX: Add dcc.Store components to hold all shared data ---
-    # This replaces the need for global variables and locks.
-    # Data is stored as JSON-serializable dictionaries.
     dcc.Store(id='hist-data-store', storage_type='memory'),
     dcc.Store(id='live-data-store', storage_type='memory'),
     dcc.Store(id='hist-alerts-store', storage_type='memory'),
     dcc.Store(id='live-alerts-store', storage_type='memory'),
-    # --- END FIX ---
-
     
     html.Div([
         html.H1("📈 Live Stock Dashboard", style={"textAlign": "center", "marginBottom": "20px"}),
@@ -301,7 +245,6 @@ app.layout = html.Div([
             )
         ], style={"width": "300px", "margin": "0 auto 30px auto"}), 
         
-        # --- Indicators are now 5-MIN ---
         html.H3("Key Live Indicators (5-Min)", style={"textAlign": "center"}),
         html.Div(id="key-indicators-panel", style={
             "display": "flex",
@@ -317,7 +260,7 @@ app.layout = html.Div([
         html.Div([
             # --- Historical Column ---
             html.Div([
-                html.H3("Historical Price (30-Day, 30-Min)", style={"textAlign": "center"}),
+                html.H3("Historical Price (30-Day, 30-Min Resampled)", style={"textAlign": "center"}), # Updated Title
                 dcc.Graph(id="price-chart-hist", style={'height': '350px'}), 
                 html.H3("Historical Volume (30-Day, Daily)", style={"textAlign": "center"}),
                 dcc.Graph(id="volume-chart-hist", style={'height': '250px'}), 
@@ -327,9 +270,9 @@ app.layout = html.Div([
             
             # --- Live Column (Now "Recent 5-Min Data") ---
             html.Div([
-                html.H3("Live Price (RTH, Last 30 Candles)", style={"textAlign": "center"}),
+                html.H3("Live Price (RTH, Last 30 Candles - 5 Min)", style={"textAlign": "center"}), # Updated Title
                 dcc.Graph(id="price-chart-live", style={'height': '350px'}),
-                html.H3("Live Volume (RTH, Last 30 Candles)", style={"textAlign": "center"}),
+                html.H3("Live Volume (RTH, Last 30 Candles - 5 Min)", style={"textAlign": "center"}),
                 dcc.Graph(id="volume-chart-live", style={'height': '250px'}),
                 html.H3("Live Intraday Alerts (5-Min RTH)"),
                 html.Div(id="alerts-panel-live", style={"whiteSpace": "pre-wrap", "height": "150px", "overflowY": "scroll", "border": "1px solid #ccc", "padding": "10px", "backgroundColor": "#fff"}),
@@ -347,21 +290,15 @@ app.layout = html.Div([
         html.Button("Send", id="llm-send", n_clicks=0, style={"padding": "10px 20px", "backgroundColor": "#007bff", "color": "white", "border": "none", "borderRadius": "5px", "cursor": "pointer", "marginTop": "10px"}),
         
         
-        dcc.Interval(id="interval", interval=600 * 1000, n_intervals=0),
-
-        # --- FIX: Removed 'alerts-panel-live-hidden-trigger' ---
+        dcc.Interval(id="interval", interval=cfg.REFRESH_INTERVAL * 1000, n_intervals=0), # Using the 5-minute interval config
     
     ], style={"maxWidth": "1200px", "margin": "20px auto", "padding": "0 20px"}) 
 ])
 
 
 # =====================================================
-# CALLBACK: Ticker Cards & Global Data Store Update (MASTER CALLBACK)
+# CALLBACK: Ticker Cards & Global Data Store Update (MASTER CALLBACK - MODIFIED)
 # =====================================================
-# --- FIX: This is now the master callback that loads ALL data from disk ---
-# It runs every 'interval' and populates the dcc.Store components.
-# All other callbacks are consumers of these stores.
-# ---
 @callback(
     Output("ticker-cards", "children"),
     Output("hist-data-store", "data"),
@@ -371,22 +308,21 @@ app.layout = html.Div([
     Input("interval", "n_intervals")
 )
 def update_cards_and_global_stores(n):
-    logger.info("Master data load: Reading all CSVs and alert JSONs from disk...")
+    logger.info("Master data load: Reading all unified data and alert JSONs from disk...")
     cards = []
     
-    # --- 1. Load ALL data into serializable dictionaries ---
     hist_data_store = {}
     live_data_store = {}
     
     for t in cfg.ALL_FETCH_TICKERS:
-        df_hist = load_data(t, "_hist.csv")
-        df_live = load_data(t, "_live.csv")
+        # CRITICAL FIX: Load the single unified file
+        df_unified = load_data(t)
         
-        if not df_hist.empty:
-            # Convert DataFrame to JSON serializable format
-            hist_data_store[t] = df_hist.to_json(orient='split', date_format='iso')
-        if not df_live.empty:
-            live_data_store[t] = df_live.to_json(orient='split', date_format='iso')
+        if not df_unified.empty:
+            # The Unified DataFrame is put into BOTH stores.
+            data_json = df_unified.to_json(orient='split', date_format='iso')
+            hist_data_store[t] = data_json
+            live_data_store[t] = data_json
     
     # --- 2. Load alerts from the JSON file ---
     all_alerts = load_alerts()
@@ -395,7 +331,7 @@ def update_cards_and_global_stores(n):
     
     # --- 3. Process Ticker Cards (and populate alert stores) ---
     for t in cfg.TICKERS:
-        # Re-constitute the live DataFrame from the JSON store data
+        # Re-constitute the live DataFrame from the JSON store data (using the unified data)
         df_live = pd.DataFrame()
         if t in live_data_store:
             try:
@@ -417,12 +353,10 @@ def update_cards_and_global_stores(n):
         new_live_alerts = ticker_alerts.get("live", [])
         new_hist_alerts = ticker_alerts.get("historical", [])
         
-        # --- OPTIMIZATION: Also get the indicators from the alert blob ---
         new_live_indicators = ticker_alerts.get("live_indicators", {})
         new_hist_indicators = ticker_alerts.get("historical_indicators", {})
 
         # --- Populate the alert stores for other callbacks ---
-        # --- Store alerts AND indicators together ---
         live_alerts_store[t] = {
             "alerts": new_live_alerts,
             "indicators": new_live_indicators
@@ -431,7 +365,6 @@ def update_cards_and_global_stores(n):
             "alerts": new_hist_alerts,
             "indicators": new_hist_indicators
         }
-        # --- END OPTIMIZATION ---
         
         if close.empty:
             price, total_volume, alert_text = "N/A", "N/A", "Market Closed / No Data"
@@ -439,7 +372,6 @@ def update_cards_and_global_stores(n):
             price = round(float(close.iloc[-1]), 2)
             total_volume = int(vol.sum()) 
             
-            # Get the latest alert for the card
             alert_text = new_live_alerts[0] if new_live_alerts else "None"
             
         cards.append(html.Div([
@@ -455,62 +387,66 @@ def update_cards_and_global_stores(n):
 
 
 # =====================================================
-# CALLBACK: Historical Charts (Now reads from dcc.Store)
+# CALLBACK: Historical Charts (MODIFIED for Resampling)
 # =====================================================
 @callback(
     Output("price-chart-hist", "figure"),
     Output("volume-chart-hist", "figure"), 
     Output("alerts-panel-hist", "children"),
     Input("ticker-dropdown", "value"),
-    Input("hist-data-store", "data"),    # <-- FIX: Input from store
-    Input("hist-alerts-store", "data") # <-- FIX: Input from store
+    Input("hist-data-store", "data"),    
+    Input("hist-alerts-store", "data") 
 )
 def update_hist_charts(ticker, hist_data_json, hist_alerts_dict):
     logger.info(f"Updating historical charts for {ticker} from dcc.Store...")
     
-    # --- 1. Re-constitute DataFrame from the store ---
-    df_hist = pd.DataFrame()
+    df_unified = pd.DataFrame()
     if hist_data_json and ticker in hist_data_json:
         try:
-            df_hist = pd.read_json(hist_data_json[ticker], orient='split', convert_dates=True)
-            df_hist.index = pd.to_datetime(df_hist.index, utc=True)
+            df_unified = pd.read_json(hist_data_json[ticker], orient='split', convert_dates=True)
+            df_unified.index = pd.to_datetime(df_unified.index, utc=True)
         except Exception as e:
             logger.error(f"Failed to read hist data from store for {ticker}: {e}")
 
-    # --- 2. Get alerts from the store ---
+    # --- NEW: Resample 5-min data to 30-min for Price Chart and Daily for Volume ---
+    if df_unified.empty:
+         alerts_list = []
+    else:
+        # 30-Minute Resampling for Price/Volume (for clarity on historical chart)
+        df_30min = df_unified.resample('30min').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna(subset=['Close'])
+
+        # Daily Resampling for Volume Chart
+        daily_vol = df_unified['Volume'].resample('D').sum()
+        daily_vol = daily_vol[daily_vol > 0]
+        
     alerts_list = []
     if hist_alerts_dict and ticker in hist_alerts_dict:
-        # --- OPTIMIZATION: Get alerts from the new store structure ---
         alerts_list = hist_alerts_dict[ticker].get("alerts", [])
     
     alerts_text = "\n".join([f"Historical - {a}" for a in alerts_list[-20:]]) \
                   if alerts_list else "No historical alerts found."
 
-    close = get_col(df_hist, ticker, "Close")
-
     price_fig = go.Figure()
-    if not close.empty:
+    if not df_unified.empty:
+        # Use the 30-minute resampled data for the historical price chart
+        close = get_col(df_30min, ticker, "Close")
         price_fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close"))
-        price_fig.update_layout(title=f"{ticker} 30-Day Price (30-Min)", xaxis_title="Datetime", yaxis_title="Price", template="plotly_white")
+        price_fig.update_layout(title=f"{ticker} 30-Day Price (30-Min Resampled)", xaxis_title="Datetime", yaxis_title="Price", template="plotly_white")
     else:
-        price_fig.update_layout(title=f"{ticker} 30-Day Price (30-Min)", template="plotly_white", annotations=[{"text": "No Historical Data Available", "showarrow": False}])
+        price_fig.update_layout(title=f"{ticker} 30-Day Price (30-Min Resampled)", template="plotly_white", annotations=[{"text": "No Historical Data Available", "showarrow": False}])
 
 
     vol_fig = go.Figure()
-    vol = get_col(df_hist, ticker, "Volume", fill_na=0)
-    if not vol.empty:
-        daily_vol = vol.resample('D').sum()
-        daily_vol = daily_vol[daily_vol > 0]
-        if not daily_vol.empty:
-            vol_fig.add_trace(go.Bar(x=daily_vol.index, y=daily_vol, name=f"Volume ({ticker})"))
-            vol_fig.update_layout(
-                title=f"{ticker} 30-Day Daily Volume",
-                xaxis_title="Date",
-                yaxis_title="Total Volume",
-                template="plotly_white"
-            )
-        else:
-            vol_fig.update_layout(title=f"{ticker} 30-Day Daily Volume", template="plotly_white", annotations=[{"text": "No Historical Volume Available", "showarrow": False}])
+    if not df_unified.empty and not daily_vol.empty:
+        vol_fig.add_trace(go.Bar(x=daily_vol.index, y=daily_vol, name=f"Volume ({ticker})"))
+        vol_fig.update_layout(
+            title=f"{ticker} 30-Day Daily Volume",
+            xaxis_title="Date",
+            yaxis_title="Total Volume",
+            template="plotly_white"
+        )
     else:
         vol_fig.update_layout(title=f"{ticker} 30-Day Daily Volume", template="plotly_white", annotations=[{"text": "No Historical Volume Available", "showarrow": False}])
 
@@ -519,9 +455,8 @@ def update_hist_charts(ticker, hist_data_json, hist_alerts_dict):
 
 
 # =====================================================
-# CALLBACK: "Live" Charts (Now "Recent 5-Min", reads from dcc.Store)
+# CALLBACK: "Live" Charts (Unchanged logic, uses unified store)
 # =====================================================
-# --- RACE CONDITION FIX: Removed Input("interval", "n_intervals") ---
 @callback(
     Output("price-chart-live", "figure"),
     Output("volume-chart-live", "figure"),
@@ -529,13 +464,13 @@ def update_hist_charts(ticker, hist_data_json, hist_alerts_dict):
     Output("key-indicators-panel", "children"), 
     Output("news-headlines-panel", "children"),
     Input("ticker-dropdown", "value"),
-    Input("live-data-store", "data"),     # <-- FIX: Input from store
-    Input("live-alerts-store", "data")  # <-- FIX: Input from store
+    Input("live-data-store", "data"),     
+    Input("live-alerts-store", "data")  
 )
-def update_live_charts(ticker, live_data_json, live_alerts_dict): # <-- FIX: Removed n_intervals
+def update_live_charts(ticker, live_data_json, live_alerts_dict): 
     logger.info(f"Updating live (5-min) charts for {ticker} from dcc.Store...")
     
-    # --- 1. LOAD NEWS HEADLINES (Still reads from disk, which is fine) ---
+    # 1. LOAD NEWS HEADLINES
     all_articles = load_news_headlines()
     ticker_articles = [
         a for a in all_articles 
@@ -561,9 +496,8 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict): # <-- FIX: Rem
                     )
                 ], style={"borderBottom": "1px solid #eee", "paddingBottom": "5px", "marginBottom": "5px"})
             )
-    # --- END NEWS LOGIC ---
 
-    # --- 2. Re-constitute DataFrame from the store ---
+    # 2. Re-constitute DataFrame from the store (using unified data)
     df_live = pd.DataFrame()
     if live_data_json and ticker in live_data_json:
         try:
@@ -576,41 +510,30 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict): # <-- FIX: Rem
         empty_fig = go.Figure().update_layout(template="plotly_white", title="Not enough data for live charts/indicators (need 21 periods).")
         return empty_fig, empty_fig, "Waiting for pipeline data...", html.P("Not enough data to compute key indicators.", style={"textAlign": "center"}), news_elements
 
+    # Use existing RTH filter on the full 5-min data
     df_rth = df_live.between_time(RTH_START, RTH_END)
     
     if df_rth.empty or len(df_rth) < 21:
-        # Chart will show RTH filters are applied, but not enough data yet
         empty_fig = go.Figure().update_layout(template="plotly_white", title="Market Closed or No RTH Data (need 21 data points).")
         return empty_fig, empty_fig, "Market Closed. No RTH alerts.", html.P("Market Closed or No RTH Data.", style={"textAlign": "center"}), news_elements
 
-    # --- 3. Get alerts and indicators from the store ---
+    # 3. Get alerts and indicators from the store
     alerts_list = []
     indicators = {}
     if live_alerts_dict and ticker in live_alerts_dict:
-        # --- OPTIMIZATION: Get alerts AND indicators from the new store structure ---
         alerts_list = live_alerts_dict[ticker].get("alerts", [])
         indicators = live_alerts_dict[ticker].get("indicators", {})
 
-    # Format alerts with a timestamp (optional, but nice)
     now_str = datetime.now().strftime('%H:%M:%S')
     alerts_text = "\n".join([f"{now_str} - {a}" for a in alerts_list[-20:]]) \
                   if alerts_list else "No RTH alerts yet"
 
-    # --- 4. CALCULATE KEY INDICATORS (on 5-min RTH data) ---
-    # --- OPTIMIZATION: All TA calculation is removed ---
-    
-    # --- OPTIMIZATION: Get values from the 'indicators' dict ---
+    # 4. CALCULATE KEY INDICATORS (on 5-min RTH data)
     rsi = indicators.get('RSI_14', np.nan)
     macd_hist = indicators.get('MACDh_12_26_9', np.nan)
     bb_width_pct = indicators.get('BBB_20_2.0', np.nan)
-    
-    # --- VWAP (Volume-Weighted Average Price) ---
-    # --- OPTIMIZATION: VWAP calculation is REMOVED ---
-    
-    # --- OPTIMIZATION (NEW): Get VWAP and Close from indicators dict ---
     vwap = indicators.get('VWAP', np.nan)
     latest_close = indicators.get('Close', np.nan)
-    # --- END VWAP OPTIMIZATION ---
     
     def format_indicator(name, value, unit="", color_logic=None):
         if pd.isna(value):
@@ -644,7 +567,7 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict): # <-- FIX: Rem
         format_indicator("VWAP Diff.", vwap_diff)
     ]
     
-    # --- 5. CHART UPDATES (Show last 30 5-min candles) ---
+    # 5. CHART UPDATES (Show last 30 5-min candles)
     df_chart_data = df_rth.tail(30).copy() 
     close = get_col(df_chart_data, ticker, "Close")
     vol_series = get_col(df_chart_data, ticker, "Volume", fill_na=0) 
@@ -670,7 +593,7 @@ def update_live_charts(ticker, live_data_json, live_alerts_dict): # <-- FIX: Rem
 
 
 # =====================================================
-# CHAT LOGIC (Includes New Rule 5 Synthesis)
+# CHAT LOGIC (Unchanged)
 # =====================================================
 @callback(
     Output("llm-response", "children"),
@@ -689,24 +612,21 @@ def update_chat_display(chat_history):
     return messages
 
 
-# --- IMMUTABILITY FIX: This callback now creates new lists instead of mutating state ---
 @callback(
     Output("chat-history-store", "data"), 
     Output("llm-prompt", "value"),        
     Input("llm-send", "n_clicks"),
     State("llm-prompt", "value"),
     State("chat-history-store", "data"),
-    background=True, # <--- FIX: Enable background callback
+    background=True, 
     prevent_initial_call=True
 )
 def chat_llm(n_clicks, prompt, chat_history): 
     if not prompt:
         return chat_history, ""
 
-    # --- FIX: Create a new list for the user prompt ---
     new_history = chat_history + [{"role": "user", "content": prompt}]
 
-    # --- FIX: Use the new_history list to build the prompt ---
     history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in new_history])
 
     retrieved_context = search_rag_index(prompt, k=3)
@@ -749,20 +669,13 @@ Helpful Analyst Answer (for the latest User question only):
     
     try:
         resp = llm.generate(payload)
-        # --- FIX: Create a final new list for the assistant's response ---
         final_history = new_history + [{"role": "assistant", "content": resp}]
     except Exception as e:
         logger.error(f"LLM Error: {e}")
-        # --- FIX: Create a final new list for the error message ---
         final_history = new_history + [{"role": "assistant", "content": "Sorry, I encountered an error. Please try again."}]
     
-    # --- FIX: Return the new, final list ---
     return final_history, ""
 
-
-# =====================================================
-# RUN APP
-# =====================================================
 if __name__ == "__main__":
     logger.info("Starting dashboard at http://127.0.0.1:8050")
     app.run(debug=False)
