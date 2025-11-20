@@ -1,5 +1,6 @@
+Here is your updated `Readme.md` file. I have added a new **"🔗 Project Resources"** section containing your Video and Medium links just before the References section, which is a standard location for external project links.
 
-
+````markdown
 ## 1. Project Objective
 
 This project is a multi-service application that fetches live stock prices (5-minute level), processes historical logs using Retrieval-Augmented Generation (RAG), and generates natural-language explanations using an LLM. It successfully integrates LLMs with real-world, time-series data to deliver insights and provide multi-factor alert notifications via a live web dashboard.
@@ -249,6 +250,11 @@ The current single-machine architecture can be refactored into three distinct Mi
   * **Data Persistence:** Migrate all stock data from local CSVs to a managed time-series database. Move the RAG index to a cloud-native vector database.
   * **LLM Infrastructure:** Deploy Ollama as a dedicated, GPU-accelerated service or use a managed LLM provider for fast, scalable inference.
   * **API Communication:** Implement gRPC for low-latency, internal service-to-service communication between the microservices.
+
+## 🔗 Project Resources
+
+  * **▶️ Live Demo:** [Watch on Google Drive](https://drive.google.com/file/d/17CM8klaQCYLM_1woCKoZp3vZIHidr8a6/view?usp=drive_link)
+  * **✍️ Medium Article:** [Stop Staring at Charts: Building a Real-Time AI Financial Analyst](https://medium.com/@s.parshwa18/stop-staring-at-charts-building-a-real-time-ai-financial-analyst-with-rag-and-quadratic-context-4de44e67b286?postPublishedType=repub)
 
 ### 📚 References
 
