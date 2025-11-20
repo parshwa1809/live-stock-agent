@@ -1,4 +1,3 @@
-Here is your updated `Readme.md` file. I have added a new **"🔗 Project Resources"** section containing your Video and Medium links just before the References section, which is a standard location for external project links.
 
 ````markdown
 ## 1. Project Objective
