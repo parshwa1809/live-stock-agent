@@ -13,5 +13,5 @@ dependencies:
   - sentence-transformers
   - faiss-cpu
   - pytorch
-  - diskcache
+  - dash[diskcache]
   - pandas-ta
