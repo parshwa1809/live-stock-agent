@@ -6,10 +6,10 @@ Master launcher for Live Stock Agent Phase 2.
 Features:
 - **One-Time Setup (NEW):** Safely fetches 30 days of 5-minute data for all
   tickers SERIALLY, with a 5-minute cooldown between *each* ticker.
-- **Service Launch:** Starts the three main services in parallel.
+- **Immediate Dashboard:** Launches the UI as soon as historical data is secured.
+- **Safety Cooldown:** Waits 5 minutes after dashboard launch before starting
+  the live API pipeline to prevent rate limits.
 - **File Structure:** Merges historical and live data into a single unified file (<TICKER>.csv).
-- **CRITICAL FIX:** Implements a strict retry loop to ensure all tickers download successfully
-  before launching the dashboard.
 """
 
 import threading
@@ -233,30 +233,40 @@ if __name__ == "__main__":
         logger.info("Shutdown requested during setup. Exiting.")
         sys.exit(0)
 
-    # --- NEW STEP: Final Mandatory Cooldown Before Live Start ---
+    # --- STEP 2: Launch Dashboard IMMEDIATELY ---
+    # The historical data is on disk, so the dashboard can render charts right now.
+    dashboard_script = project_root / "live_dashboard.py"
+    if dashboard_script.exists():
+        logger.info("🚀 Launching Dashboard UI immediately...")
+        start_thread(dashboard_script)
+        sleep(2) # Brief pause to let Dash spin up
+    else:
+        logger.error(f"❌ Script not found: {dashboard_script}")
+
+    # --- STEP 3: Final Mandatory Cooldown Before Live Services ---
     FINAL_COOLDOWN = 300 # 5 minutes
-    logger.info(f"🎯 Historical setup complete. Waiting {FINAL_COOLDOWN}s before first LIVE burst...")
+    logger.info(f"🎯 Dashboard is LIVE. Waiting {FINAL_COOLDOWN}s before starting API Pipeline & RAG to ensure safety...")
+    
     for _ in range(FINAL_COOLDOWN):
         if STOP_EVENT.is_set(): break
         sleep(1)
 
-    # --- STEP 2: Launch all three main services ---
-    scripts = [
+    # --- STEP 4: Launch Backend Services (Pipeline & Vector Index) ---
+    backend_scripts = [
         project_root / "phase2_pipeline.py",
-        project_root / "build_vector_index.py",
-        project_root / "live_dashboard.py"
+        project_root / "build_vector_index.py"
     ]
 
-    logger.info("🚀 Launching Phase 2 services...")
+    logger.info("🚀 Cooldown complete. Launching Backend Services (Live Pipeline & RAG)...")
 
-    for script in scripts:
+    for script in backend_scripts:
         if script.exists():
             start_thread(script)
-            sleep(2) # Stagger the startup to prevent initial resource clash
+            sleep(2) # Stagger the startup
         else:
             logger.error(f"❌ Script not found: {script}")
 
-    # --- STEP 3: Wait for shutdown signal ---
+    # --- STEP 5: Wait for shutdown signal ---
     try:
         while not STOP_EVENT.is_set():
             sleep(1)
